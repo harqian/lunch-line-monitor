@@ -8,6 +8,9 @@ repo_directory=$(cd "$(dirname "$0")/.." && pwd)
 
 sudo raspi-config nonint do_spi 0
 sudo raspi-config nonint do_i2c 0
+# a whole jpeg frame is read in one spi transaction; spidev's default 4096-byte limit is far too small
+cmdline_path=/boot/firmware/cmdline.txt
+grep -q 'spidev.bufsiz=' "$cmdline_path" || sudo sed -i '1 s/$/ spidev.bufsiz=262144/' "$cmdline_path"
 sudo apt-get update
 sudo apt-get install -y libgl1 libglib2.0-0  # opencv-python (pulled in by ultralytics) needs these on pi os lite
 sudo usermod -aG spi,i2c "$USER"

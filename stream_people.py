@@ -33,12 +33,16 @@ class WebcamSource:
 
 class ArducamSource:
     def __init__(self, resolution):
-        from pi.arducam_mini_2mp_plus import ArducamMini2MPPlus  # spidev/smbus2 only exist on the pi
+        from pi import arducam_mini_2mp_plus  # spidev/smbus2 only exist on the pi
 
-        self.camera = ArducamMini2MPPlus(resolution)
+        self.driver = arducam_mini_2mp_plus
+        self.camera = arducam_mini_2mp_plus.ArducamMini2MPPlus(resolution)
 
     def read_frame(self):
-        jpeg = self.camera.capture_jpeg()
+        try:
+            jpeg = self.camera.capture_jpeg()
+        except self.driver.CorruptCapture as error:
+            raise BadFrame(str(error)) from error
         frame = cv2.imdecode(numpy.frombuffer(jpeg, numpy.uint8), cv2.IMREAD_COLOR)
         if frame is None:
             raise BadFrame(f"arducam returned {len(jpeg)} bytes that opencv could not decode")

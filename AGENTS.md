@@ -14,6 +14,9 @@ camera -> person detection (YOLO26n) -> live count + box positions on https://nu
 - pi: `./pi/deploy.sh user@host`, reboot, then `uv run python -m pi.arducam_mini_2mp_plus --selftest /tmp/arducam-test.jpg`, then `journalctl -u lunch-line-monitor -f`. `/tmp/lunch-line-latest.jpg` on the pi is the latest annotated frame, for aiming the camera.
 
 ## facts
+- wiring (verified against arducam docs, 2026-10-08): CS 24 (CE0), MOSI 19, MISO 21, SCK 23, GND 6, SDA 3, SCL 5, **VCC on pin 1 (3.3V), not pin 2**: the board's level-shifter pull-ups likely go to VCC, which would put 5V on pi GPIO (no schematic found; arducam's own pi guide uses 3.3V).
+- driver facts + sources: `.sanity/arducam_research.md` (not committed). spi mode 0 at 4 MHz (8 MHz unreliable in the field). whole frame read in one chip-select-low spidev transaction, which needs `spidev.bufsiz=262144` in cmdline.txt (setup.sh adds it; the driver fails loudly if it's missing). no fixed dummy byte on the plus; the jpeg is cut from FFD8 to the next FFD9. chunked reads (re-send 0x3C per chunk) are also endorsed by arducam staff if the bufsiz route ever fails.
+- the driver has never touched real hardware. `.sanity/fake_arducam_test.py` runs it plus `--source arducam` against an emulated arduchip/ov2640 serving a real jpeg.
 - 1 update/s keeps cloudflare's free tier: websocket messages bill 20:1, and a durable object awake 24h is ~11k of the 13k free GB-s/day. don't raise the rate without checking the plan.
 - linux torch comes from the pytorch cpu index (`tool.uv.sources`); pypi's linux wheels drag in cuda. verified resolution for aarch64: torch 2.14.1+cpu, no nvidia libraries besides the pure-python nvidia-ml-py.
 - measured 2026-10-08: ~0.12-0.15 s per frame end-to-end on the mac (mps).
