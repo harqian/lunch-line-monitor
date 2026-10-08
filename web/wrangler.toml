@@ -1,0 +1,15 @@
+name = "lunch-line-monitor"
+main = "src/index.js"
+compatibility_date = "2026-06-01"
+workers_dev = false
+routes = [{ pattern = "nuevasocratica.com/lunch-line-monitor*", zone_name = "nuevasocratica.com" }]
+
+# INGEST_TOKEN is a secret (wrangler secret put INGEST_TOKEN); the pi sends it as a bearer token
+
+[[durable_objects.bindings]]
+name = "LUNCH_LINE"
+class_name = "LunchLine"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["LunchLine"]

@@ -1,0 +1,15 @@
+[Unit]
+Description=lunch line people counter -> nuevasocratica.com/lunch-line-monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=__USER__
+WorkingDirectory=__REPO__
+EnvironmentFile=/etc/lunch-line-monitor.env
+ExecStart=__UV__ run --frozen stream_people.py --source arducam --save-annotated /tmp/lunch-line-latest.jpg
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

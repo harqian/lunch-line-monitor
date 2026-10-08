@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lunch Line</title>
+<meta name="theme-color" content="#0047ff">
+<style>
+  :root {
+    --field: #0047ff;            /* nueva socratica blue, same as the home page */
+    --field-offline: #3b4566;    /* the whole page goes slate when the camera is gone */
+    --ink: #ffffff;
+    --ink-soft: rgba(255, 255, 255, 0.78);
+    --ink-faint: rgba(255, 255, 255, 0.5);
+    --frame-line: rgba(255, 255, 255, 0.32);
+    --frame-floor: rgba(255, 255, 255, 0.06);
+    --figure: rgba(255, 255, 255, 0.92);
+    --unit: 8px;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+    --sans: ui-sans-serif, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; }
+  body {
+    background: var(--field);
+    color: var(--ink);
+    font-family: var(--sans);
+    transition: background-color 600ms ease-out;
+  }
+  body.offline { background: var(--field-offline); }
+  main {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: calc(var(--unit) * 3) calc(var(--unit) * 2) calc(var(--unit) * 6);
+    display: flex;
+    flex-direction: column;
+    gap: calc(var(--unit) * 3);
+  }
+  .masthead { font-size: 13px; letter-spacing: 0.08em; color: var(--ink-faint); }
+  .masthead a { color: inherit; text-decoration: none; }
+  .board { display: flex; align-items: baseline; gap: calc(var(--unit) * 2); flex-wrap: wrap; }
+  .count {
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+    font-size: clamp(96px, 30vw, 200px);
+    line-height: 0.85;
+    letter-spacing: -0.04em;
+  }
+  .count-label { font-size: 20px; color: var(--ink-soft); }
+  .status { display: flex; align-items: center; gap: var(--unit); font-family: var(--mono); font-size: 14px; color: var(--ink-soft); }
+  .pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--ink); opacity: 0.35; }
+  body.live .pulse { animation: beat 1.6s ease-out infinite; opacity: 1; }
+  @keyframes beat { 0% { opacity: 1; } 70% { opacity: 0.25; } 100% { opacity: 1; } }
+  .frame {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 4 / 3;
+    border: 1px solid var(--frame-line);
+    border-radius: 6px;
+    background: var(--frame-floor);
+    overflow: hidden;
+  }
+  /* each detection is drawn as a faceless figure scaled to its box: no camera image ever leaves the pi */
+  .figure { position: absolute; transition: left 400ms ease-out, top 400ms ease-out, width 400ms ease-out, height 400ms ease-out, opacity 400ms ease-out; }
+  .figure .head { position: absolute; left: 50%; top: 0; width: 34%; aspect-ratio: 1; transform: translateX(-50%); border-radius: 50%; background: var(--figure); }
+  .figure .body { position: absolute; left: 12%; right: 12%; top: 22%; bottom: 0; border-radius: 40% 40% 6px 6px; background: var(--figure); }
+  body.offline .figure { opacity: 0.25 !important; }
+  body.offline .count, body.offline .count-label { opacity: 0.35; }  /* a stale count must not read as current */
+  .frame-empty { position: absolute; inset: 0; display: grid; place-items: center; font-family: var(--mono); font-size: 14px; color: var(--ink-faint); }
+  .footnote { font-size: 13px; line-height: 1.5; color: var(--ink-faint); max-width: 52ch; }
+</style>
+</head>
+<body>
+<main>
+  <div class="masthead"><a href="/">nueva socratica</a> / lunch line</div>
+  <div class="board">
+    <div class="count" id="count">–</div>
+    <div class="count-label" id="count-label">people in view</div>
+  </div>
+  <div class="status"><span class="pulse"></span><span id="status-text">connecting…</span></div>
+  <div class="frame" id="frame"><div class="frame-empty" id="frame-empty">waiting for the camera</div></div>
+  <p class="footnote">a camera by the lunch line counts people on a raspberry pi. only the count and box positions are sent here; the video never leaves the pi.</p>
+</main>
+<script>
+  const STALE_AFTER_MILLISECONDS = 15000;
+  const elements = {
+    count: document.getElementById("count"),
+    countLabel: document.getElementById("count-label"),
+    statusText: document.getElementById("status-text"),
+    frame: document.getElementById("frame"),
+    frameEmpty: document.getElementById("frame-empty"),
+  };
+  let latestUpdate = null;
+  let socketOpen = false;
+  let reconnectDelay = 1000;
+
+  function describeAge(milliseconds) {
+    const seconds = Math.max(0, Math.round(milliseconds / 1000));
+    if (seconds < 60) return `${seconds}s ago`;
+    const minutes = Math.round(seconds / 60);
+    if (minutes < 60) return `${minutes} min ago`;
+    return `${Math.round(minutes / 60)} h ago`;
+  }
+
+  function renderStatus() {
+    document.body.classList.remove("live", "offline");
+    if (!socketOpen) { elements.statusText.textContent = "reconnecting…"; return; }
+    if (latestUpdate === null) { elements.statusText.textContent = "connected · waiting for the camera"; return; }
+    const age = Date.now() - latestUpdate.received_at;
+    if (age > STALE_AFTER_MILLISECONDS) {
+      document.body.classList.add("offline");
+      elements.statusText.textContent = `camera offline · last seen ${describeAge(age)}`;
+    } else {
+      document.body.classList.add("live");
+      elements.statusText.textContent = `live · updated ${describeAge(age)}`;
+    }
+  }
+
+  function makeFigure() {
+    const figure = document.createElement("div");
+    figure.className = "figure";
+    const body = document.createElement("div");
+    body.className = "body";
+    const head = document.createElement("div");
+    head.className = "head";
+    figure.append(body, head);
+    return figure;
+  }
+
+  function renderUpdate(update) {
+    latestUpdate = update;
+    elements.count.textContent = update.count;
+    elements.countLabel.textContent = update.count === 1 ? "person in view" : "people in view";
+    elements.frame.style.aspectRatio = `${update.frame_width} / ${update.frame_height}`;
+    elements.frameEmpty.style.display = "none";
+    const figures = [...elements.frame.querySelectorAll(".figure")];
+    update.people.forEach((person, index) => {
+      const figure = figures[index] ?? elements.frame.appendChild(makeFigure());
+      const [x1, y1, x2, y2] = person.box;
+      figure.style.left = `${(100 * x1) / update.frame_width}%`;
+      figure.style.top = `${(100 * y1) / update.frame_height}%`;
+      figure.style.width = `${(100 * (x2 - x1)) / update.frame_width}%`;
+      figure.style.height = `${(100 * (y2 - y1)) / update.frame_height}%`;
+      figure.style.opacity = 0.45 + 0.55 * person.confidence;
+    });
+    figures.slice(update.people.length).forEach((figure) => figure.remove());
+    renderStatus();
+  }
+
+  function connect() {
+    const socket = new WebSocket(`${location.origin.replace(/^http/, "ws")}/lunch-line-monitor/live`);
+    socket.onopen = () => { socketOpen = true; reconnectDelay = 1000; renderStatus(); };
+    socket.onmessage = (event) => renderUpdate(JSON.parse(event.data));
+    socket.onclose = () => {
+      socketOpen = false;
+      renderStatus();
+      setTimeout(connect, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+    };
+  }
+
+  connect();
+  setInterval(renderStatus, 1000);
+</script>
+</body>
+</html>

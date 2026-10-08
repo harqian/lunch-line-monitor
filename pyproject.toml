@@ -1,0 +1,24 @@
+[project]
+name = "lunch-line-monitor"
+version = "0.1.0"
+description = "count people in the nueva lunch line and stream it to nuevasocratica.com/lunch-line-monitor"
+requires-python = ">=3.12"
+dependencies = [
+    "opencv-python>=5.0.0.93",
+    "ultralytics>=8.4.171",
+    "websockets>=15",
+    "torch>=2.8",
+    "torchvision>=0.23",
+    "spidev>=3.6; sys_platform == 'linux'",
+    "smbus2>=0.5; sys_platform == 'linux'",
+]
+
+# on the pi, pull cpu-only torch; pypi's linux wheels drag in gigabytes of cuda libraries
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
