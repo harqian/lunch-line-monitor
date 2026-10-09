@@ -32,7 +32,7 @@ CAPTURE_DONE = 0x08
 FIFO_LENGTH_REGISTERS = (0x42, 0x43, 0x44)  # low, middle, high byte
 FIFO_LENGTH_HIGH_MASK = 0x7F
 BURST_FIFO_READ = 0x3C
-SPIDEV_BUFFER_SIZE_PATH = "/sys/module/spidev/parameters/bufsiz"  # pi/setup.sh raises it via cmdline.txt
+SPI_CHUNK_BYTES = 4095  # plus the command byte = py-spidev's 4096-byte transfer cap
 MAX_FIFO_BYTES = 0x7FFFFF  # the plus has 8 MB; 0x5FFFF in arducam's pi example is the non-plus value
 
 # ov2640 sensor registers
@@ -71,8 +71,6 @@ class ArducamMini2MPPlus:
         self.spi.open(SPI_BUS, SPI_CHIP_SELECT)
         self.spi.max_speed_hz = SPI_SPEED_HZ
         self.spi.mode = 0
-        with open(SPIDEV_BUFFER_SIZE_PATH) as buffer_size_file:
-            self.spi_buffer_size = int(buffer_size_file.read())
         self.i2c = smbus2.SMBus(I2C_BUS)
         self.reset_cpld()
         self.check_spi()
@@ -137,12 +135,13 @@ class ArducamMini2MPPlus:
         return ((high & FIFO_LENGTH_HIGH_MASK) << 16) | (middle << 8) | low
 
     def read_fifo(self, length):
-        # the whole frame in one chip-select-low transaction: burst command, then clock out `length` bytes.
-        # spidev caps a transaction at bufsiz (4096 by default), so frames need the raised limit from pi/setup.sh
-        if length + 1 > self.spi_buffer_size:
-            raise RuntimeError(f"frame is {length} bytes but spidev.bufsiz is {self.spi_buffer_size}; run pi/setup.sh (adds spidev.bufsiz to cmdline.txt) and reboot")
-        response = self.spi.xfer2(bytes([BURST_FIFO_READ]) + bytes(length))
-        return bytes(response[1:])
+        # py-spidev caps one transfer at 4096 bytes, so read in chunks; each chunk is its own chip-select-low
+        # burst (0x3C then data). the fifo read pointer persists between bursts (arducam staff, ArduCAM/Arduino #53)
+        data = bytearray()
+        while len(data) < length:
+            chunk_length = min(SPI_CHUNK_BYTES, length - len(data))
+            data += bytes(self.spi.xfer2([BURST_FIFO_READ] + [0] * chunk_length)[1:])
+        return bytes(data)
 
     def capture_jpeg(self, timeout_seconds=3.0):
         self.write_register(FIFO_CONTROL_REGISTER, FIFO_CLEAR)  # flush
