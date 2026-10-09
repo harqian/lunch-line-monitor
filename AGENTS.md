@@ -1,6 +1,6 @@
 # lunch_line_monitor
 
-camera -> person detection (YOLO26n) -> live count + box positions on https://nuevasocratica.com/lunch-line-monitor. target hardware: raspberry pi + arducam mini 2mp plus (OV2640, spi + i2c). no images leave the device, only `{count, people:[{box, confidence}], frame_width, frame_height}`.
+camera -> person detection (YOLO26n) -> live count + box positions on https://nuevasocratica.com/lunch-line-monitor. target hardware: raspberry pi + arducam mini 2mp plus (OV2640, spi + i2c). each update is `{count, people:[{box, confidence}], frame_width, frame_height, jpeg (base64)}`; the page shows the live frame with boxes (changed from faceless figures on 2026-10-08 at Harrison's request).
 
 ## layout
 - `detect_people.py`: mac webcam viewer + the shared detection functions (`load_model`, `detect_people`, `draw_people`).
@@ -18,7 +18,7 @@ camera -> person detection (YOLO26n) -> live count + box positions on https://nu
 - driver facts + sources: `.sanity/arducam_research.md` (not committed). spi mode 0 at 4 MHz (8 MHz unreliable in the field). frames are read in 4095-byte bursts (py-spidev caps a transfer at 4096 even with a larger kernel bufsiz), each re-sending 0x3C; verified on hardware 2026-10-08. no fixed dummy byte on the plus; the jpeg is cut from FFD8 to the next FFD9. chunked reads (re-send 0x3C per chunk) are also endorsed by arducam staff if the bufsiz route ever fails.
 - verified on the real pi 4 (2026-10-08): selftest 16.9 KB jpeg at 640x480 in 0.27 s; service ~0.8 s/frame. reach the pi via `ssh lunchline@lunchline.local` (usb-c gadget cable or Nueva-Guest wifi) or connect.raspberrypi.com (device 'lunchline'). user lunchline has passwordless sudo.
 - `.sanity/fake_arducam_test.py` runs it plus `--source arducam` against an emulated arduchip/ov2640 serving a real jpeg.
-- 1 update/s keeps cloudflare's free tier: websocket messages bill 20:1, and a durable object awake 24h is ~11k of the 13k free GB-s/day. don't raise the rate without checking the plan.
+- updates go as fast as capture + detection (~0.6 s on the pi 4 at `--image-size 416`; 640 was 0.9 s, 320 is 0.27 s). still inside cloudflare's free tier: websocket messages bill 20:1, and a durable object awake 24h is ~11k of the 13k free GB-s/day. don't raise the rate without checking the plan.
 - linux torch comes from the pytorch cpu index (`tool.uv.sources`); pypi's linux wheels drag in cuda. verified resolution for aarch64: torch 2.14.1+cpu, no nvidia libraries besides the pure-python nvidia-ml-py.
 - measured 2026-10-08: ~0.12-0.15 s per frame end-to-end on the mac (mps).
 - known weakness: tightly overlapping people (exactly a lunch line) can merge into one box -> undercount. bigger model (`--model models/yolo26s.pt`) or lower `--confidence` is the first lever.

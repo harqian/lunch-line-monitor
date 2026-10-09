@@ -29,9 +29,9 @@ def load_model(model_name):
     return YOLO(model_name)
 
 
-def detect_people(model, frame, confidence_threshold, device):
+def detect_people(model, frame, confidence_threshold, device, image_size=640):
     """returns a list of (x1, y1, x2, y2, confidence) in pixel coords."""
-    result = model.predict(frame, classes=[PERSON_CLASS_ID], conf=confidence_threshold, device=device, verbose=False)[0]
+    result = model.predict(frame, classes=[PERSON_CLASS_ID], conf=confidence_threshold, device=device, imgsz=image_size, verbose=False)[0]
     corners = result.boxes.xyxy.cpu().numpy()
     confidences = result.boxes.conf.cpu().numpy()
     return [(int(x1), int(y1), int(x2), int(y2), float(confidence)) for (x1, y1, x2, y2), confidence in zip(corners, confidences)]

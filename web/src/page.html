@@ -61,11 +61,10 @@
     background: var(--frame-floor);
     overflow: hidden;
   }
-  /* each detection is drawn as a faceless figure scaled to its box: no camera image ever leaves the pi */
-  .figure { position: absolute; transition: left 400ms ease-out, top 400ms ease-out, width 400ms ease-out, height 400ms ease-out, opacity 400ms ease-out; }
-  .figure .head { position: absolute; left: 50%; top: 0; width: 34%; aspect-ratio: 1; transform: translateX(-50%); border-radius: 50%; background: var(--figure); }
-  .figure .body { position: absolute; left: 12%; right: 12%; top: 22%; bottom: 0; border-radius: 40% 40% 6px 6px; background: var(--figure); }
-  body.offline .figure { opacity: 0.25 !important; }
+  .frame img { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  .box { position: absolute; border: 2px solid #3cff7a; border-radius: 3px; transition: left 150ms linear, top 150ms linear, width 150ms linear, height 150ms linear; }
+  .box span { position: absolute; left: -2px; top: -20px; background: #3cff7a; color: #002a10; font: 600 11px var(--mono); padding: 2px 4px; border-radius: 3px 3px 0 0; }
+  body.offline .frame img, body.offline .box { opacity: 0.35; }
   body.offline .count, body.offline .count-label { opacity: 0.35; }  /* a stale count must not read as current */
   .frame-empty { position: absolute; inset: 0; display: grid; place-items: center; font-family: var(--mono); font-size: 14px; color: var(--ink-faint); }
   .footnote { font-size: 13px; line-height: 1.5; color: var(--ink-faint); max-width: 52ch; }
@@ -79,8 +78,8 @@
     <div class="count-label" id="count-label">people in view</div>
   </div>
   <div class="status"><span class="pulse"></span><span id="status-text">connecting…</span></div>
-  <div class="frame" id="frame"><div class="frame-empty" id="frame-empty">waiting for the camera</div></div>
-  <p class="footnote">a camera by the lunch line counts people on a raspberry pi. only the count and box positions are sent here; the video never leaves the pi.</p>
+  <div class="frame" id="frame"><img id="frame-image" alt=""><div class="frame-empty" id="frame-empty">waiting for the camera</div></div>
+  <p class="footnote">a camera by the lunch line counts people on a raspberry pi.</p>
 </main>
 <script>
   const STALE_AFTER_MILLISECONDS = 15000;
@@ -90,6 +89,7 @@
     statusText: document.getElementById("status-text"),
     frame: document.getElementById("frame"),
     frameEmpty: document.getElementById("frame-empty"),
+    frameImage: document.getElementById("frame-image"),
   };
   let latestUpdate = null;
   let socketOpen = false;
@@ -117,15 +117,11 @@
     }
   }
 
-  function makeFigure() {
-    const figure = document.createElement("div");
-    figure.className = "figure";
-    const body = document.createElement("div");
-    body.className = "body";
-    const head = document.createElement("div");
-    head.className = "head";
-    figure.append(body, head);
-    return figure;
+  function makeBox() {
+    const box = document.createElement("div");
+    box.className = "box";
+    box.append(document.createElement("span"));
+    return box;
   }
 
   function renderUpdate(update) {
@@ -134,17 +130,18 @@
     elements.countLabel.textContent = update.count === 1 ? "person in view" : "people in view";
     elements.frame.style.aspectRatio = `${update.frame_width} / ${update.frame_height}`;
     elements.frameEmpty.style.display = "none";
-    const figures = [...elements.frame.querySelectorAll(".figure")];
+    elements.frameImage.src = `data:image/jpeg;base64,${update.jpeg}`;
+    const boxes = [...elements.frame.querySelectorAll(".box")];
     update.people.forEach((person, index) => {
-      const figure = figures[index] ?? elements.frame.appendChild(makeFigure());
+      const box = boxes[index] ?? elements.frame.appendChild(makeBox());
+      box.firstChild.textContent = `person ${person.confidence.toFixed(2)}`;
       const [x1, y1, x2, y2] = person.box;
-      figure.style.left = `${(100 * x1) / update.frame_width}%`;
-      figure.style.top = `${(100 * y1) / update.frame_height}%`;
-      figure.style.width = `${(100 * (x2 - x1)) / update.frame_width}%`;
-      figure.style.height = `${(100 * (y2 - y1)) / update.frame_height}%`;
-      figure.style.opacity = 0.45 + 0.55 * person.confidence;
+      box.style.left = `${(100 * x1) / update.frame_width}%`;
+      box.style.top = `${(100 * y1) / update.frame_height}%`;
+      box.style.width = `${(100 * (x2 - x1)) / update.frame_width}%`;
+      box.style.height = `${(100 * (y2 - y1)) / update.frame_height}%`;
     });
-    figures.slice(update.people.length).forEach((figure) => figure.remove());
+    boxes.slice(update.people.length).forEach((box) => box.remove());
     renderStatus();
   }
 
