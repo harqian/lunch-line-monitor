@@ -62,9 +62,21 @@
     overflow: hidden;
   }
   .frame img { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
-  .box { position: absolute; border: 2px solid #3cff7a; border-radius: 3px; transition: left 150ms linear, top 150ms linear, width 150ms linear, height 150ms linear; }
-  .box span { position: absolute; left: -2px; top: -20px; background: #3cff7a; color: #002a10; font: 600 11px var(--mono); padding: 2px 4px; border-radius: 3px 3px 0 0; }
-  body.offline .frame img, body.offline .box { opacity: 0.35; }
+  .box { --person: #3cff7a; position: absolute; border: 2px solid var(--person); border-radius: 3px; transition: left 150ms linear, top 150ms linear, width 150ms linear, height 150ms linear; }
+  .box span { position: absolute; left: -2px; top: -20px; background: var(--person); color: #0b0b0b; font: 600 11px var(--mono); padding: 2px 4px; border-radius: 3px 3px 0 0; white-space: nowrap; }
+  /* vertical regions: boundary lines, people per region along the bottom, crossings per minute at each boundary */
+  .regions { position: absolute; inset: 0; pointer-events: none; }
+  .region-line { position: absolute; top: 0; bottom: 0; border-left: 1px dashed rgba(255, 255, 255, 0.7); }
+  .region-count, .crossing-rate, .region-seconds { position: absolute; transform: translateX(-50%); background: rgba(0, 0, 0, 0.55); color: var(--ink); font-family: var(--mono); font-variant-numeric: tabular-nums; border-radius: 3px; white-space: nowrap; }
+  .region-count { bottom: 6px; font-size: 18px; font-weight: 600; padding: 1px 6px; }
+  .region-seconds { bottom: 36px; font-size: 11px; padding: 2px 4px; }
+  .crossing-rate { bottom: 36px; font-size: 11px; line-height: 1.3; padding: 2px 4px; text-align: center; white-space: pre; }
+  .traversal { font-family: var(--mono); font-size: 16px; color: var(--ink-soft); }
+  .traversal strong { color: var(--ink); font-size: 22px; }
+  .traversal .breakdown { font-size: 13px; color: var(--ink-faint); margin-top: 4px; }
+  body.offline .traversal { opacity: 0.35; }
+  .frame-caption { margin-top: calc(var(--unit) * -2); font-family: var(--mono); font-size: 12px; color: var(--ink-faint); }
+  body.offline .frame img, body.offline .box, body.offline .regions { opacity: 0.35; }
   body.offline .count, body.offline .count-label { opacity: 0.35; }  /* a stale count must not read as current */
   .frame-empty { position: absolute; inset: 0; display: grid; place-items: center; font-family: var(--mono); font-size: 14px; color: var(--ink-faint); }
   .footnote { font-size: 13px; line-height: 1.5; color: var(--ink-faint); max-width: 52ch; }
@@ -77,8 +89,10 @@
     <div class="count" id="count">–</div>
     <div class="count-label" id="count-label">people in view</div>
   </div>
+  <div class="traversal" id="traversal" hidden></div>
   <div class="status"><span class="pulse"></span><span id="status-text">connecting…</span></div>
-  <div class="frame" id="frame"><img id="frame-image" alt=""><div class="frame-empty" id="frame-empty">waiting for the camera</div></div>
+  <div class="frame" id="frame"><img id="frame-image" alt=""><div class="regions" id="regions"></div><div class="frame-empty" id="frame-empty">waiting for the camera</div></div>
+  <div class="frame-caption" id="frame-caption" hidden></div>
   <p class="footnote">a camera by the lunch line counts people on a raspberry pi.</p>
 </main>
 <script>
@@ -90,6 +104,9 @@
     frame: document.getElementById("frame"),
     frameEmpty: document.getElementById("frame-empty"),
     frameImage: document.getElementById("frame-image"),
+    regions: document.getElementById("regions"),
+    frameCaption: document.getElementById("frame-caption"),
+    traversal: document.getElementById("traversal"),
   };
   let latestUpdate = null;
   let socketOpen = false;
@@ -117,11 +134,74 @@
     }
   }
 
-  function makeBox() {
+  // same golden-angle hue as person_color_bgr in track_people.py (hsv 0.75/1.0 == hsl 100%/62.5%)
+  function personColor(personId) {
+    return `hsl(${(personId * 137.508) % 360} 100% 62.5%)`;
+  }
+
+  function makeBox(key) {
     const box = document.createElement("div");
     box.className = "box";
+    box.dataset.key = key;
     box.append(document.createElement("span"));
     return box;
+  }
+
+  function describeDuration(seconds) {
+    if (seconds < 90) return `${Math.round(seconds)} s`;
+    const minutes = seconds / 60;
+    return minutes < 90 ? `${Math.round(minutes)} min` : `${(minutes / 60).toFixed(1)} h`;
+  }
+
+  function placed(className, leftPercent) {
+    const element = document.createElement("div");
+    element.className = className;
+    element.style.left = `${leftPercent}%`;
+    return element;
+  }
+
+  // regions = {people, average_people, seconds_in_region: [per region], rightward_per_minute / leftward_per_minute: [per boundary],
+  //            smoothing_seconds, wait_seconds = pace_wait_seconds + queue_wait_seconds, queued_people, served_per_minute,
+  //            line_direction}; all running averages (regions.py).
+  //            times are null until the crowd has moved, and while it's stopped
+  function renderRegions(regions) {
+    elements.frameCaption.hidden = !regions;
+    elements.traversal.hidden = !regions;
+    if (!regions) { elements.regions.replaceChildren(); return; }
+    const regionCount = regions.people.length;
+    if (elements.regions.querySelectorAll(".region-count").length !== regionCount) {
+      const parts = [];
+      for (let boundary = 1; boundary < regionCount; boundary++) {
+        parts.push(placed("region-line", (100 * boundary) / regionCount), placed("crossing-rate", (100 * boundary) / regionCount));
+      }
+      for (let region = 0; region < regionCount; region++) {
+        parts.push(placed("region-count", (100 * (region + 0.5)) / regionCount), placed("region-seconds", (100 * (region + 0.5)) / regionCount));
+      }
+      elements.regions.replaceChildren(...parts);
+    }
+    elements.regions.querySelectorAll(".region-count").forEach((element, region) => { element.textContent = regions.people[region]; });
+    elements.regions.querySelectorAll(".region-seconds").forEach((element, region) => {
+      const seconds = regions.seconds_in_region?.[region];
+      element.textContent = seconds == null ? "?s" : `${Math.round(seconds)}s`;
+    });
+    elements.traversal.replaceChildren();
+    if (regions.wait_seconds == null) {
+      elements.traversal.textContent = "wait: the line hasn't moved yet";
+    } else {
+      const strong = document.createElement("strong");
+      strong.textContent = `~${describeDuration(regions.wait_seconds)}`;
+      const breakdown = document.createElement("div");
+      breakdown.className = "breakdown";
+      const queue = regions.queued_people > 0 && regions.queue_wait_seconds != null
+        ? ` + ${describeDuration(regions.queue_wait_seconds)} behind ${regions.queued_people} in line (served ${regions.served_per_minute.toFixed(1)}/min)`
+        : " · nobody queued";
+      breakdown.textContent = `${describeDuration(regions.pace_wait_seconds)} walk${queue}`;
+      elements.traversal.append(strong, ` wait if you join now (${regions.line_direction === "rightward" ? "→" : "←"})`, breakdown);
+    }
+    elements.regions.querySelectorAll(".crossing-rate").forEach((element, boundary) => {
+      element.textContent = `→ ${regions.rightward_per_minute[boundary].toFixed(1)}\n← ${regions.leftward_per_minute[boundary].toFixed(1)}`;
+    });
+    elements.frameCaption.textContent = `${regionCount} regions · people per region along the bottom, est. seconds spent in each above · arrows: crossings per minute · running averages over ~${Math.round(regions.smoothing_seconds)} s`;
   }
 
   function renderUpdate(update) {
@@ -131,17 +211,23 @@
     elements.frame.style.aspectRatio = `${update.frame_width} / ${update.frame_height}`;
     elements.frameEmpty.style.display = "none";
     elements.frameImage.src = `data:image/jpeg;base64,${update.jpeg}`;
-    const boxes = [...elements.frame.querySelectorAll(".box")];
+    // one box element per tracked person, so a box glides with its person instead of jumping between people
+    const boxesByKey = new Map([...elements.frame.querySelectorAll(".box")].map((box) => [box.dataset.key, box]));
     update.people.forEach((person, index) => {
-      const box = boxes[index] ?? elements.frame.appendChild(makeBox());
-      box.firstChild.textContent = `person ${person.confidence.toFixed(2)}`;
+      const tracked = typeof person.id === "number";
+      const key = tracked ? `id-${person.id}` : `index-${index}`;
+      const box = boxesByKey.get(key) ?? elements.frame.appendChild(makeBox(key));
+      boxesByKey.delete(key);
+      if (tracked) box.style.setProperty("--person", personColor(person.id));
+      box.firstChild.textContent = tracked ? `#${person.id} ${person.confidence.toFixed(2)}` : `person ${person.confidence.toFixed(2)}`;
       const [x1, y1, x2, y2] = person.box;
       box.style.left = `${(100 * x1) / update.frame_width}%`;
       box.style.top = `${(100 * y1) / update.frame_height}%`;
       box.style.width = `${(100 * (x2 - x1)) / update.frame_width}%`;
       box.style.height = `${(100 * (y2 - y1)) / update.frame_height}%`;
     });
-    boxes.slice(update.people.length).forEach((box) => box.remove());
+    boxesByKey.forEach((box) => box.remove());  // people who left (or are hidden while the tracker waits for them)
+    renderRegions(update.regions);
     renderStatus();
   }
 

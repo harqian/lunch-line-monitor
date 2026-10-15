@@ -4,7 +4,8 @@
   uv run stream_people.py --source webcam --camera 0  # any opencv camera (how the pipeline was tested from a laptop)
 
 reads the ingest token from the LUNCH_LINE_INGEST_TOKEN environment variable.
-each update carries the jpeg frame plus the person boxes, drawn on the page.
+each update carries the jpeg frame plus the person boxes, drawn on the page, and the people per
+vertical region + boundary crossing rates (regions.py; region count etc. in lunch_line.toml).
 """
 import argparse
 import base64
@@ -18,6 +19,8 @@ from websockets.exceptions import InvalidStatus, WebSocketException
 from websockets.sync.client import connect
 
 import detect_people as detection
+import regions as region_counting
+from track_people import PeopleTracker
 
 INGEST_URL = "wss://nuevasocratica.com/lunch-line-monitor/ingest"
 MAX_CONSECUTIVE_BAD_FRAMES = 10
@@ -84,19 +87,24 @@ class LiveFeed:
         self.connection = None
 
 
-def build_update(frame, people, jpeg):
+def build_update(frame, tracked_people, jpeg, region_snapshot):
     frame_height, frame_width = frame.shape[:2]
     return {
         "captured_at": time.time(),
         "frame_width": frame_width,
         "frame_height": frame_height,
-        "count": len(people),
+        "count": len(tracked_people),
         "jpeg": base64.b64encode(jpeg).decode("ascii"),
-        "people": [{"box": [x1, y1, x2, y2], "confidence": round(confidence, 3)} for x1, y1, x2, y2, confidence in people],
+        "regions": region_snapshot.to_update(),
+        "people": [
+            {"id": person_id, "box": [x1, y1, x2, y2], "confidence": round(confidence, 3)}
+            for person_id, (x1, y1, x2, y2, confidence) in tracked_people
+        ],
     }
 
 
-def run(source, model, feed, confidence_threshold, device, image_size, seconds_between_updates, annotated_path):
+def run(source, model, feed, region_counter, confidence_threshold, device, image_size, seconds_between_updates, annotated_path):
+    tracker = PeopleTracker()
     consecutive_bad_frames = 0
     while True:
         started = time.monotonic()
@@ -109,12 +117,14 @@ def run(source, model, feed, confidence_threshold, device, image_size, seconds_b
                 raise
             continue
         consecutive_bad_frames = 0
-        people = detection.detect_people(model, frame, confidence_threshold, device, image_size)
-        feed.send(build_update(frame, people, jpeg))
+        tracked = tracker.update(detection.detect_people(model, frame, confidence_threshold, device, image_size))
+        region_snapshot = region_counter.update(tracked, frame.shape[1], started)
+        feed.send(build_update(frame, tracked, jpeg, region_snapshot))
         if annotated_path:
-            cv2.imwrite(annotated_path, detection.draw_people(frame, people))
+            people = [person for _, person in tracked]
+            cv2.imwrite(annotated_path, detection.draw_people(frame, people, person_ids=[person_id for person_id, _ in tracked], regions=region_snapshot))
         elapsed = time.monotonic() - started
-        print(f"{len(people)} people ({elapsed:.2f}s)", flush=True)
+        print(f"{len(tracked)} people {[person_id for person_id, _ in tracked]} per region {region_snapshot.people} ({elapsed:.2f}s)", flush=True)
         time.sleep(max(0.0, seconds_between_updates - elapsed))
 
 
@@ -129,13 +139,15 @@ def main():
     parser.add_argument("--seconds-between-updates", type=float, default=0.0, help="0 = as fast as capture + detection allow")
     parser.add_argument("--save-annotated", help="overwrite this image with the latest annotated frame (for aiming the camera)")
     parser.add_argument("--url", default=INGEST_URL)
+    parser.add_argument("--config", default=str(region_counting.DEFAULT_CONFIG_PATH), help="region settings (toml)")
     arguments = parser.parse_args()
 
     token = os.environ["LUNCH_LINE_INGEST_TOKEN"]
+    region_counter = region_counting.RegionCounter.from_config(region_counting.load_config(arguments.config))
     device = detection.pick_device()
     model = detection.load_model(arguments.model)
     source = ArducamSource(arguments.resolution) if arguments.source == "arducam" else WebcamSource(arguments.camera)
-    run(source, model, LiveFeed(arguments.url, token), arguments.confidence, device, arguments.image_size, arguments.seconds_between_updates, arguments.save_annotated)
+    run(source, model, LiveFeed(arguments.url, token), region_counter, arguments.confidence, device, arguments.image_size, arguments.seconds_between_updates, arguments.save_annotated)
 
 
 if __name__ == "__main__":

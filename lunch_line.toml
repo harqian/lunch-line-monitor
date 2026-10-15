@@ -1,0 +1,14 @@
+# settings for stream_people.py and detect_people.py's live viewer
+
+[regions]
+# the frame is split into this many equal-width vertical regions
+count = 10
+# crossing rates, people per region and the times derived from them are running averages that
+# weight roughly the last this-many seconds (exponential, so older movement fades rather than drops off)
+smoothing_seconds = 60
+# a tracked person only changes region once their box center is this fraction of a region width
+# past the boundary, so someone standing on a boundary doesn't cross it every frame
+hysteresis = 0.1
+# a person counts as queued (standing / shuffling in line) while their own pace would take longer
+# than this to cross the frame; the wait then also accounts for everyone queued ahead
+queued_if_slower_than_seconds = 20
