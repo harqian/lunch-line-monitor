@@ -11,3 +11,4 @@ wheels/
 .sanity/
 models/
 web/.wrangler/
+.DS_Store
