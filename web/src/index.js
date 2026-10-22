@@ -3,6 +3,8 @@ import page from "./page.html";
 
 const BASE_PATH = "/lunch-line-monitor";
 const ROLE_HEADER = "x-lunch-line-role";
+// one history row per 2 s keeps writes (~43k/day) under the free plan's 100k sqlite rows written per day
+const RECORD_INTERVAL_MILLISECONDS = 2000;
 
 // one durable object fans camera updates out to every open browser over hibernatable websockets
 export class LunchLine extends DurableObject {
@@ -10,6 +12,16 @@ export class LunchLine extends DurableObject {
     super(ctx, env);
     // memory only: lost if the object hibernates, which only happens after the camera stops sending
     this.latestUpdate = null;
+    this.lastRecordedAt = 0;
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS history (recorded_at INTEGER PRIMARY KEY, count INTEGER NOT NULL, people TEXT NOT NULL)"
+    );
+  }
+
+  history(sinceMilliseconds) {
+    return this.ctx.storage.sql
+      .exec("SELECT recorded_at, count, people FROM history WHERE recorded_at >= ? ORDER BY recorded_at", sinceMilliseconds)
+      .toArray();
   }
 
   async fetch(request) {
@@ -29,6 +41,15 @@ export class LunchLine extends DurableObject {
     update.received_at = Date.now();
     this.latestUpdate = JSON.stringify(update);
     for (const viewer of this.ctx.getWebSockets("viewer")) viewer.send(this.latestUpdate);
+    if (update.received_at - this.lastRecordedAt >= RECORD_INTERVAL_MILLISECONDS) {
+      this.lastRecordedAt = update.received_at;
+      this.ctx.storage.sql.exec(
+        "INSERT OR REPLACE INTO history (recorded_at, count, people) VALUES (?, ?, ?)",
+        update.received_at,
+        update.count,
+        JSON.stringify(update.people)
+      );
+    }
   }
 
   webSocketClose(socket, code, reason) {
@@ -44,9 +65,36 @@ async function bearerTokenMatches(authorizationHeader, expectedToken) {
   return given.byteLength === expected.byteLength && crypto.subtle.timingSafeEqual(given, expected);
 }
 
+function pacificTime(milliseconds) {
+  return new Date(milliseconds).toLocaleString("sv-SE", { timeZone: "America/Los_Angeles" });
+}
+
+function lunchLineFor(env) {
+  return env.LUNCH_LINE.get(env.LUNCH_LINE.idFromName("nueva-lunch-line"));
+}
+
+// GET /lunch-line-monitor/history?hours=24[&format=json]: one row per ~2 s of camera updates
+async function historyResponse(url, env) {
+  const hours = Number(url.searchParams.get("hours") ?? 24);
+  if (!(hours > 0)) return new Response("hours must be a positive number", { status: 400 });
+  const rows = await lunchLineFor(env).history(Date.now() - hours * 3600 * 1000);
+  if (url.searchParams.get("format") === "json") {
+    const body = rows.map((row) => ({ recorded_at: row.recorded_at, pacific_time: pacificTime(row.recorded_at), count: row.count, people: JSON.parse(row.people) }));
+    return Response.json(body, { headers: { "cache-control": "no-store" } });
+  }
+  const lines = ["pacific_time,unix_milliseconds,count"];
+  for (const row of rows) lines.push(`${pacificTime(row.recorded_at)},${row.recorded_at},${row.count}`);
+  return new Response(lines.join("\n") + "\n", {
+    headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": 'inline; filename="lunch-line-history.csv"', "cache-control": "no-store" },
+  });
+}
+
 export default {
   async fetch(request, env) {
-    const path = new URL(request.url).pathname.replace(/\/+$/, "");
+    const url = new URL(request.url);
+    const path = url.pathname.replace(/\/+$/, "");
+
+    if (path === `${BASE_PATH}/history`) return historyResponse(url, env);
 
     if (path === BASE_PATH) {
       return new Response(page, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache" } });
@@ -63,8 +111,7 @@ export default {
       }
       const forwarded = new Request(request);
       forwarded.headers.set(ROLE_HEADER, role); // always overwrite so a browser can't claim to be the camera
-      const lunchLine = env.LUNCH_LINE.get(env.LUNCH_LINE.idFromName("nueva-lunch-line"));
-      return lunchLine.fetch(forwarded);
+      return lunchLineFor(env).fetch(forwarded);
     }
 
     return new Response("not found", { status: 404 });
