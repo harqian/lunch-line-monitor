@@ -10,7 +10,7 @@ camera -> person detection (YOLO26n) -> live count + box positions on https://nu
 
 ## run / verify
 - mac end-to-end: `LUNCH_LINE_INGEST_TOKEN=$(op item get s5ty2d52vyc33b46kwfpi3kzfq --fields label=lunchline_ingest_token --reveal) uv run stream_people.py --source webcam --camera 1 --save-annotated .sanity/x.png`, then open the page. camera index moves around (iPhone continuity camera can take index 0 and return no frames); the MacBook camera was index 1 on 2026-10-08.
-- deploy worker: `cd web && CLOUDFLARE_API_TOKEN=<1P 'Cloudflare API token' field full_token> CLOUDFLARE_ACCOUNT_ID=b5767c459ae1102e08c8dd559b76ee15 wrangler deploy`. `curl` websocket checks need `--http1.1` (over h2 the Upgrade header is dropped and the worker answers 426).
+- deploy worker: `cd web && CLOUDFLARE_API_TOKEN=<1P 'Cloudflare API token' field full_token> CLOUDFLARE_ACCOUNT_ID=b5767c459ae1102e08c8dd559b76ee15 wrangler deploy`. for about a minute after a deploy some edges still serve the old version (a new route can flip between 200 and 404), so poll until it's consistent before calling it broken. `curl` websocket checks need `--http1.1` (over h2 the Upgrade header is dropped and the worker answers 426).
 - pi: `./pi/deploy.sh user@host`, reboot, then `uv run python -m pi.arducam_mini_2mp_plus --selftest /tmp/arducam-test.jpg`, then `journalctl -u lunch-line-monitor -f`. `/tmp/lunch-line-latest.jpg` on the pi is the latest annotated frame, for aiming the camera.
 
 ## facts
