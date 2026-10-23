@@ -12,3 +12,4 @@ wheels/
 models/
 web/.wrangler/
 .DS_Store
+web/.dev.vars
