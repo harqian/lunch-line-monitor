@@ -6,10 +6,12 @@ writes one jpeg per frame named by pacific time (to the millisecond) and people 
 each frame's boxes, and history.json (the ~2 s count history). frames already on disk are skipped.
 """
 import argparse
+import concurrent.futures
 import datetime
 import json
 import os
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -23,8 +25,17 @@ def fetch(url, token=None):
     headers = {"User-Agent": "lunch-line-monitor-downloader"}
     if token is not None:
         headers["Authorization"] = f"Bearer {token}"
-    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as response:
-        return response.read()
+    # cloudflare occasionally resets a connection under parallel load; retry a few times, then crash
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as response:
+                return response.read()
+        except urllib.error.HTTPError:
+            raise  # a real answer from the worker (401, 404), not a flaky connection
+        except (urllib.error.URLError, ConnectionError):
+            if attempt == 3:
+                raise
+            time.sleep(2**attempt)
 
 
 def list_frames(base_url, token, day):
@@ -43,6 +54,7 @@ def main():
     parser.add_argument("--hours", type=float, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--base-url", default=BASE_URL)
+    parser.add_argument("--parallel-downloads", type=int, default=16)
     arguments = parser.parse_args()
 
     token = os.environ["LUNCH_LINE_INGEST_TOKEN"]
@@ -54,7 +66,6 @@ def main():
 
     first_day = datetime.datetime.fromtimestamp(cutoff_milliseconds / 1000, PACIFIC).date()
     last_day = datetime.datetime.now(PACIFIC).date()
-    downloaded = already_present = 0
     manifest = []
     for day_offset in range((last_day - first_day).days + 1):
         for frame in list_frames(arguments.base_url, token, first_day + datetime.timedelta(days=day_offset)):
@@ -64,13 +75,19 @@ def main():
             captured = datetime.datetime.fromtimestamp(captured_milliseconds / 1000, PACIFIC)
             filename = f"{captured:%Y-%m-%d_%H-%M-%S}.{captured_milliseconds % 1000:03d}_{frame['count']}people.jpg"
             manifest.append({"file": filename, "pacific_time": captured.isoformat(timespec="milliseconds")} | frame)
-            if (output / filename).exists():
-                already_present += 1
-                continue
-            (output / filename).write_bytes(fetch(f"{arguments.base_url}/frames/{frame['key']}", token))
-            downloaded += 1
+    missing = [entry for entry in manifest if not (output / entry["file"]).exists()]
+
+    # one request is ~1 s round trip, slower than the pi captures, so download in parallel
+    def download(entry):
+        partial = output / (entry["file"] + ".part")
+        partial.write_bytes(fetch(f"{arguments.base_url}/frames/{entry['key']}", token))
+        partial.rename(output / entry["file"])  # rename last so an interrupted run never leaves a truncated jpeg
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=arguments.parallel_downloads) as pool:
+        for _ in pool.map(download, missing):
+            pass
     (output / "frames.jsonl").write_text("".join(json.dumps(entry) + "\n" for entry in manifest))
-    print(f"{len(manifest)} frames in range: {downloaded} downloaded, {already_present} already present -> {output}")
+    print(f"{len(manifest)} frames in range: {len(missing)} downloaded, {len(manifest) - len(missing)} already present -> {output}")
 
 
 if __name__ == "__main__":

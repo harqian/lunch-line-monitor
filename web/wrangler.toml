@@ -10,7 +10,7 @@ routes = [{ pattern = "nuevasocratica.com/lunch-line-monitor*", zone_name = "nue
 name = "LUNCH_LINE"
 class_name = "LunchLine"
 
-# frames saved every 10 s by the durable object (see FRAME_INTERVAL_MILLISECONDS)
+# every camera frame is saved by the durable object as <pacific date>/<unix ms>.jpg
 [[r2_buckets]]
 binding = "FRAMES"
 bucket_name = "lunch-line-frames"
