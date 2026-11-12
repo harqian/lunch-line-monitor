@@ -1,6 +1,6 @@
 # lunch_line_monitor
 
-camera -> person detection (YOLO26n) -> live count + box positions on https://nuevasocratica.com/lunch-line-monitor. target hardware: raspberry pi + arducam mini 2mp plus (OV2640, spi + i2c). each update is `{count, people:[{box, confidence}], frame_width, frame_height, jpeg (base64)}`; the page shows the live frame with boxes (changed from faceless figures on 2026-10-08 at Harrison's request).
+camera -> person detection (YOLO26n) -> live count + box positions on https://nuevasocratica.com/lunch-line-monitor. target hardware: raspberry pi + arducam mini 2mp plus (OV2640, spi + i2c). each update is `{count, people:[{box, confidence}], frame_width, frame_height, jpeg (base64)}`; the page shows the live frame with boxes (changed from faceless figures on 2026-10-08 at Harrison's request). below the count is a trend chart of the last 90 min (Harrison's 2026-11-11 algorithm note): faint dots = each ~2 s history row, bold line = trailing 2 min time-window mean (trailing so the right edge is the current estimate), line breaks on gaps >30 s. it loads `/history?hours=1.5` (csv) once, then appends live websocket updates; all in `web/src/page.html` (`renderTrend`, `smoothedReadings`), inline svg, no libraries.
 
 ## layout
 - `detect_people.py`: mac webcam viewer + the shared detection functions (`load_model`, `detect_people`, `draw_people`).

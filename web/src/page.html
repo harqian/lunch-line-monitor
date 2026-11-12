@@ -68,6 +68,14 @@
   body.offline .count, body.offline .count-label { opacity: 0.35; }  /* a stale count must not read as current */
   .frame-empty { position: absolute; inset: 0; display: grid; place-items: center; font-family: var(--mono); font-size: 14px; color: var(--ink-faint); }
   .footnote { font-size: 13px; line-height: 1.5; color: var(--ink-faint); max-width: 52ch; }
+  .trend { display: flex; flex-direction: column; gap: var(--unit); }
+  .trend-title { font-family: var(--mono); font-size: 13px; color: var(--ink-soft); }
+  .trend svg { width: 100%; height: auto; display: block; overflow: visible; }
+  .trend .grid { stroke: var(--frame-line); stroke-width: 1; }
+  .trend .tick { fill: var(--ink-faint); font: 11px var(--mono); }
+  .trend .raw { fill: rgba(255, 255, 255, 0.28); }
+  .trend .smoothed { fill: none; stroke: var(--ink); stroke-width: 2.5; stroke-linejoin: round; stroke-linecap: round; }
+  .trend .empty { fill: var(--ink-faint); font: 13px var(--mono); }
 </style>
 </head>
 <body>
@@ -78,6 +86,10 @@
     <div class="count-label" id="count-label">people in view</div>
   </div>
   <div class="status"><span class="pulse"></span><span id="status-text">connecting…</span></div>
+  <div class="trend">
+    <div class="trend-title">last 90 min · dots = each reading, line = 2 min average</div>
+    <svg id="trend" viewBox="0 0 720 200" role="img" aria-label="people in view over the last 90 minutes"></svg>
+  </div>
   <div class="frame" id="frame"><img id="frame-image" alt=""><div class="frame-empty" id="frame-empty">waiting for the camera</div></div>
   <p class="footnote">a camera by the lunch line counts people on a raspberry pi. <a href="/lunch-line-monitor/history?hours=168" style="color: inherit">download the count history (csv, last 7 days)</a></p>
 </main>
@@ -142,6 +154,7 @@
       box.style.height = `${(100 * (y2 - y1)) / update.frame_height}%`;
     });
     boxes.slice(update.people.length).forEach((box) => box.remove());
+    addTrendReading(update);
     renderStatus();
   }
 
@@ -157,8 +170,88 @@
     };
   }
 
+  // trend: count over [now - 90 min, now], raw readings plus a trailing time-window average
+  const TREND_WINDOW_MILLISECONDS = 90 * 60 * 1000;
+  const SMOOTHING_WINDOW_MILLISECONDS = 2 * 60 * 1000;
+  const TREND_SAMPLE_MILLISECONDS = 2000; // matches the worker's history row interval
+  const TREND_GAP_MILLISECONDS = 30000; // readings further apart than this = camera was off, so the line breaks
+  const trendSvg = document.getElementById("trend");
+  let trendReadings = []; // [{time, count}], oldest first
+
+  async function loadTrendHistory() {
+    const response = await fetch(`/lunch-line-monitor/history?hours=${TREND_WINDOW_MILLISECONDS / 3600000}`, { cache: "no-store" });
+    if (!response.ok) throw new Error(`history request failed: ${response.status}`);
+    const lines = (await response.text()).trim().split("\n").slice(1);
+    const loaded = lines.filter(Boolean).map((line) => {
+      const [, unixMilliseconds, count] = line.split(",");
+      return { time: Number(unixMilliseconds), count: Number(count) };
+    });
+    // keep live readings that arrived while the history request was in flight
+    const lastLoadedTime = loaded.length ? loaded[loaded.length - 1].time : 0;
+    trendReadings = loaded.concat(trendReadings.filter((reading) => reading.time > lastLoadedTime));
+    renderTrend();
+  }
+
+  function addTrendReading(update) {
+    const last = trendReadings[trendReadings.length - 1];
+    if (last && update.received_at - last.time < TREND_SAMPLE_MILLISECONDS) return;
+    trendReadings.push({ time: update.received_at, count: update.count });
+  }
+
+  function smoothedReadings(readings) {
+    // trailing mean over the last SMOOTHING_WINDOW, so the right edge is the current estimate, not a future-peeking one
+    const smoothed = [];
+    let windowStart = 0;
+    let windowSum = 0;
+    readings.forEach((reading, index) => {
+      windowSum += reading.count;
+      while (readings[windowStart].time < reading.time - SMOOTHING_WINDOW_MILLISECONDS) windowSum -= readings[windowStart++].count;
+      smoothed.push({ time: reading.time, count: windowSum / (index - windowStart + 1) });
+    });
+    return smoothed;
+  }
+
+  function renderTrend() {
+    const now = Date.now();
+    const start = now - TREND_WINDOW_MILLISECONDS;
+    trendReadings = trendReadings.filter((reading) => reading.time >= start - SMOOTHING_WINDOW_MILLISECONDS);
+    const visible = trendReadings.filter((reading) => reading.time >= start);
+    const width = 720, height = 200, left = 28, right = 8, top = 8, bottom = 22;
+    const highestCount = Math.max(4, ...visible.map((reading) => reading.count));
+    const countStep = Math.ceil(highestCount / 4);
+    const maximumCount = countStep * Math.ceil(highestCount / countStep);
+    const x = (time) => left + ((time - start) / TREND_WINDOW_MILLISECONDS) * (width - left - right);
+    const y = (count) => top + (1 - count / maximumCount) * (height - top - bottom);
+    const parts = [];
+    for (let count = 0; count <= maximumCount; count += countStep) {
+      parts.push(`<line class="grid" x1="${left}" x2="${width - right}" y1="${y(count)}" y2="${y(count)}"/>`);
+      parts.push(`<text class="tick" x="${left - 6}" y="${y(count) + 4}" text-anchor="end">${count}</text>`);
+    }
+    const fifteenMinutes = 15 * 60 * 1000;
+    for (let tick = Math.ceil(start / fifteenMinutes) * fifteenMinutes; tick <= now; tick += fifteenMinutes) {
+      const label = new Date(tick).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: "America/Los_Angeles" }).toLowerCase().replace(" ", "");
+      parts.push(`<text class="tick" x="${x(tick)}" y="${height - 4}" text-anchor="middle">${label}</text>`);
+    }
+    if (visible.length === 0) {
+      parts.push(`<text class="empty" x="${(left + width - right) / 2}" y="${height / 2}" text-anchor="middle">no readings in the last 90 min</text>`);
+    }
+    for (const reading of visible) parts.push(`<circle class="raw" cx="${x(reading.time).toFixed(1)}" cy="${y(reading.count).toFixed(1)}" r="1.6"/>`);
+    let path = "";
+    let previousTime = null;
+    for (const point of smoothedReadings(trendReadings)) {
+      if (point.time < start) { previousTime = point.time; continue; }
+      const command = path === "" || point.time - previousTime > TREND_GAP_MILLISECONDS ? "M" : "L";
+      path += `${command}${x(point.time).toFixed(1)},${y(point.count).toFixed(1)}`;
+      previousTime = point.time;
+    }
+    if (path) parts.push(`<path class="smoothed" d="${path}"/>`);
+    trendSvg.innerHTML = parts.join("");
+  }
+
   connect();
   setInterval(renderStatus, 1000);
+  loadTrendHistory();
+  setInterval(renderTrend, 5000);
 </script>
 </body>
 </html>
