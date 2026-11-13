@@ -67,6 +67,7 @@
   body.offline .frame img, body.offline .box { opacity: 0.35; }
   body.offline .count, body.offline .count-label { opacity: 0.35; }  /* a stale count must not read as current */
   .frame-empty { position: absolute; inset: 0; display: grid; place-items: center; font-family: var(--mono); font-size: 14px; color: var(--ink-faint); }
+  .disclaimer { margin: 0; font-size: 13px; line-height: 1.5; color: var(--ink-soft); max-width: 60ch; }
   .footnote { font-size: 13px; line-height: 1.5; color: var(--ink-faint); max-width: 52ch; }
   .feedback { display: flex; flex-direction: column; gap: var(--unit); }
   .feedback-title { font-family: var(--mono); font-size: 13px; color: var(--ink-soft); }
@@ -91,12 +92,13 @@
   <div class="masthead"><a href="/">nuevasocratica.com</a>/lunch-line-monitor</div>
   <div class="board">
     <div class="count" id="count">–</div>
-    <div class="count-label" id="count-label">people in view</div>
+    <div class="count-label" id="count-label">people detected</div>
   </div>
   <div class="status"><span class="pulse"></span><span id="status-text">connecting…</span></div>
+  <p class="disclaimer">this is a computer vision estimate, not a headcount. people standing close together or behind someone else get missed, so the real line is almost always longer than this number. read it as a gauge of line length: higher means longer.</p>
   <div class="trend">
     <div class="trend-title">last 90 min · dots = each reading, line = 2 min average</div>
-    <svg id="trend" viewBox="0 0 720 200" role="img" aria-label="people in view over the last 90 minutes"></svg>
+    <svg id="trend" viewBox="0 0 720 200" role="img" aria-label="people detected over the last 90 minutes"></svg>
   </div>
   <div class="frame" id="frame"><img id="frame-image" alt=""><div class="frame-empty" id="frame-empty">waiting for the camera</div></div>
   <form class="feedback" id="feedback-form">
@@ -152,7 +154,7 @@
   function renderUpdate(update) {
     latestUpdate = update;
     elements.count.textContent = update.count;
-    elements.countLabel.textContent = update.count === 1 ? "person in view" : "people in view";
+    elements.countLabel.textContent = update.count === 1 ? "person detected" : "people detected";
     elements.frame.style.aspectRatio = `${update.frame_width} / ${update.frame_height}`;
     if (update.jpeg) {
       elements.frameEmpty.style.display = "none";
