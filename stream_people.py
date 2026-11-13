@@ -4,7 +4,7 @@
   uv run stream_people.py --source webcam --camera 0  # any opencv camera (how the pipeline was tested from a laptop)
 
 reads the ingest token from the LUNCH_LINE_INGEST_TOKEN environment variable.
-each update carries the jpeg frame plus the person boxes, drawn on the page.
+each update carries a pixelated jpeg plus the person boxes, drawn on the page. the raw frame never leaves the pi.
 """
 import argparse
 import base64
@@ -95,15 +95,16 @@ def pixelated_jpeg(frame):
     return cv2.imencode(".jpg", blocky, [cv2.IMWRITE_JPEG_QUALITY, 70])[1].tobytes()
 
 
-def build_update(frame, people, jpeg):
+def build_update(frame, people):
     frame_height, frame_width = frame.shape[:2]
     return {
         "captured_at": time.time(),
         "frame_width": frame_width,
         "frame_height": frame_height,
         "count": len(people),
-        "jpeg": base64.b64encode(pixelated_jpeg(frame)).decode("ascii"),  # broadcast to the public page
-        "raw_jpeg": base64.b64encode(jpeg).decode("ascii"),  # archived to r2 only (token-protected), never broadcast
+        # the raw frame never leaves the pi; the site only shows a jpeg marked with its pixel_block_size
+        "jpeg": base64.b64encode(pixelated_jpeg(frame)).decode("ascii"),
+        "pixel_block_size": PIXEL_BLOCK_SIZE,
         "people": [{"box": [x1, y1, x2, y2], "confidence": round(confidence, 3)} for x1, y1, x2, y2, confidence in people],
     }
 
@@ -113,7 +114,7 @@ def run(source, model, feed, confidence_threshold, device, image_size, seconds_b
     while True:
         started = time.monotonic()
         try:
-            frame, jpeg = source.read_frame()
+            frame, _ = source.read_frame()
         except BadFrame as error:
             consecutive_bad_frames += 1
             print(f"bad frame {consecutive_bad_frames}/{MAX_CONSECUTIVE_BAD_FRAMES}: {error}", flush=True)
@@ -122,7 +123,7 @@ def run(source, model, feed, confidence_threshold, device, image_size, seconds_b
             continue
         consecutive_bad_frames = 0
         people = detection.detect_people(model, frame, confidence_threshold, device, image_size)
-        feed.send(build_update(frame, people, jpeg))
+        feed.send(build_update(frame, people))
         if annotated_path:
             cv2.imwrite(annotated_path, detection.draw_people(frame, people))
         elapsed = time.monotonic() - started

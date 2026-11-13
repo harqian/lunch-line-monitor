@@ -15,13 +15,11 @@ export class LunchLine extends DurableObject {
     this.lastRecordedAt = 0;
     const sql = this.ctx.storage.sql;
     sql.exec("CREATE TABLE IF NOT EXISTS history (recorded_at INTEGER PRIMARY KEY, count INTEGER NOT NULL, people TEXT NOT NULL)");
-    const columns = sql.exec("PRAGMA table_info(history)").toArray().map((column) => column.name);
-    if (!columns.includes("frame_key")) sql.exec("ALTER TABLE history ADD COLUMN frame_key TEXT");
   }
 
   history(sinceMilliseconds) {
     return this.ctx.storage.sql
-      .exec("SELECT recorded_at, count, people, frame_key FROM history WHERE recorded_at >= ? ORDER BY recorded_at", sinceMilliseconds)
+      .exec("SELECT recorded_at, count, people FROM history WHERE recorded_at >= ? ORDER BY recorded_at", sinceMilliseconds)
       .toArray();
   }
 
@@ -40,31 +38,19 @@ export class LunchLine extends DurableObject {
       throw new Error(`malformed camera update: ${String(message).slice(0, 200)}`);
     }
     update.received_at = Date.now();
-    // the camera sends a pixelated `jpeg` for viewers and the untouched `raw_jpeg` for the archive.
-    // an older camera build sends only a raw `jpeg`: archive it, but never show it to viewers
-    const rawJpeg = update.raw_jpeg ?? update.jpeg;
+    // nothing raw is kept or broadcast (Eric Spross, 2026-11-12: no recording of identifiable people).
+    // only a camera build that pixelates on the pi marks its `jpeg` with `pixel_block_size`; an older build's raw `jpeg` is dropped
     const { raw_jpeg, ...forViewers } = update;
-    if (raw_jpeg === undefined) delete forViewers.jpeg;
+    if (typeof update.pixel_block_size !== "number") delete forViewers.jpeg;
     this.latestUpdate = JSON.stringify(forViewers);
     for (const viewer of this.ctx.getWebSockets("viewer")) viewer.send(this.latestUpdate);
-    // every frame is archived (~1.6/s from the pi); list them per day at /lunch-line-monitor/frames?day=YYYY-MM-DD
-    let frameKey = null;
-    if (rawJpeg) {
-      frameKey = `${pacificTime(update.received_at).slice(0, 10)}/${update.received_at}.jpg`;
-      const jpegBytes = Uint8Array.from(atob(rawJpeg), (character) => character.charCodeAt(0));
-      await this.env.FRAMES.put(frameKey, jpegBytes, {
-        httpMetadata: { contentType: "image/jpeg" },
-        customMetadata: { count: String(update.count), people: JSON.stringify(update.people) },
-      });
-    }
     if (update.received_at - this.lastRecordedAt < RECORD_INTERVAL_MILLISECONDS) return;
     this.lastRecordedAt = update.received_at;
     this.ctx.storage.sql.exec(
-      "INSERT OR REPLACE INTO history (recorded_at, count, people, frame_key) VALUES (?, ?, ?, ?)",
+      "INSERT OR REPLACE INTO history (recorded_at, count, people) VALUES (?, ?, ?)",
       update.received_at,
       update.count,
-      JSON.stringify(update.people),
-      frameKey
+      JSON.stringify(update.people)
     );
   }
 
@@ -100,12 +86,11 @@ async function historyResponse(url, env) {
       pacific_time: pacificTime(row.recorded_at),
       count: row.count,
       people: JSON.parse(row.people),
-      frame: row.frame_key, // download at /lunch-line-monitor/frames/<frame> with the bearer token
     }));
     return Response.json(body, { headers: { "cache-control": "no-store" } });
   }
-  const lines = ["pacific_time,unix_milliseconds,count,frame"];
-  for (const row of rows) lines.push(`${pacificTime(row.recorded_at)},${row.recorded_at},${row.count},${row.frame_key ?? ""}`);
+  const lines = ["pacific_time,unix_milliseconds,count"];
+  for (const row of rows) lines.push(`${pacificTime(row.recorded_at)},${row.recorded_at},${row.count}`);
   return new Response(lines.join("\n") + "\n", {
     headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": 'inline; filename="lunch-line-history.csv"', "cache-control": "no-store" },
   });
@@ -117,32 +102,6 @@ export default {
     const path = url.pathname.replace(/\/+$/, "");
 
     if (path === `${BASE_PATH}/history`) return historyResponse(url, env);
-
-    // saved frames are an archive of students' faces, so unlike the live view they need the token
-    if (path === `${BASE_PATH}/frames` || path.startsWith(`${BASE_PATH}/frames/`)) {
-      if (!(await bearerTokenMatches(request.headers.get("Authorization"), env.INGEST_TOKEN))) {
-        return new Response("unauthorized", { status: 401 });
-      }
-    }
-
-    // GET /lunch-line-monitor/frames?day=YYYY-MM-DD[&cursor=...]: up to 1000 frames per page, oldest first
-    if (path === `${BASE_PATH}/frames`) {
-      const day = url.searchParams.get("day");
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(day ?? "")) return new Response("day must be YYYY-MM-DD (pacific)", { status: 400 });
-      const listing = await env.FRAMES.list({ prefix: `${day}/`, cursor: url.searchParams.get("cursor") ?? undefined, include: ["customMetadata"] });
-      const frames = listing.objects.map((object) => ({
-        key: object.key,
-        count: Number(object.customMetadata.count),
-        people: JSON.parse(object.customMetadata.people),
-      }));
-      return Response.json({ frames, cursor: listing.truncated ? listing.cursor : null }, { headers: { "cache-control": "no-store" } });
-    }
-
-    if (path.startsWith(`${BASE_PATH}/frames/`)) {
-      const frame = await env.FRAMES.get(path.slice(`${BASE_PATH}/frames/`.length));
-      if (frame === null) return new Response("no such frame", { status: 404 });
-      return new Response(frame.body, { headers: { "content-type": "image/jpeg", "cache-control": "private, max-age=31536000, immutable" } });
-    }
 
     if (path === BASE_PATH) {
       return new Response(page, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache" } });

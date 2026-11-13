@@ -10,11 +10,6 @@ routes = [{ pattern = "nuevasocratica.com/lunch-line-monitor*", zone_name = "nue
 name = "LUNCH_LINE"
 class_name = "LunchLine"
 
-# every camera frame is saved by the durable object as <pacific date>/<unix ms>.jpg
-[[r2_buckets]]
-binding = "FRAMES"
-bucket_name = "lunch-line-frames"
-
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["LunchLine"]
