@@ -141,8 +141,15 @@
     elements.count.textContent = update.count;
     elements.countLabel.textContent = update.count === 1 ? "person in view" : "people in view";
     elements.frame.style.aspectRatio = `${update.frame_width} / ${update.frame_height}`;
-    elements.frameEmpty.style.display = "none";
-    elements.frameImage.src = `data:image/jpeg;base64,${update.jpeg}`;
+    if (update.jpeg) {
+      elements.frameEmpty.style.display = "none";
+      elements.frameImage.style.display = "";
+      elements.frameImage.src = `data:image/jpeg;base64,${update.jpeg}`;
+    } else {
+      elements.frameEmpty.textContent = "image hidden for privacy";
+      elements.frameEmpty.style.display = "";
+      elements.frameImage.style.display = "none";
+    }
     const boxes = [...elements.frame.querySelectorAll(".box")];
     update.people.forEach((person, index) => {
       const box = boxes[index] ?? elements.frame.appendChild(makeBox());

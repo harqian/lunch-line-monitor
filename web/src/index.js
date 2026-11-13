@@ -40,13 +40,18 @@ export class LunchLine extends DurableObject {
       throw new Error(`malformed camera update: ${String(message).slice(0, 200)}`);
     }
     update.received_at = Date.now();
-    this.latestUpdate = JSON.stringify(update);
+    // the camera sends a pixelated `jpeg` for viewers and the untouched `raw_jpeg` for the archive.
+    // an older camera build sends only a raw `jpeg`: archive it, but never show it to viewers
+    const rawJpeg = update.raw_jpeg ?? update.jpeg;
+    const { raw_jpeg, ...forViewers } = update;
+    if (raw_jpeg === undefined) delete forViewers.jpeg;
+    this.latestUpdate = JSON.stringify(forViewers);
     for (const viewer of this.ctx.getWebSockets("viewer")) viewer.send(this.latestUpdate);
     // every frame is archived (~1.6/s from the pi); list them per day at /lunch-line-monitor/frames?day=YYYY-MM-DD
     let frameKey = null;
-    if (update.jpeg) {
+    if (rawJpeg) {
       frameKey = `${pacificTime(update.received_at).slice(0, 10)}/${update.received_at}.jpg`;
-      const jpegBytes = Uint8Array.from(atob(update.jpeg), (character) => character.charCodeAt(0));
+      const jpegBytes = Uint8Array.from(atob(rawJpeg), (character) => character.charCodeAt(0));
       await this.env.FRAMES.put(frameKey, jpegBytes, {
         httpMetadata: { contentType: "image/jpeg" },
         customMetadata: { count: String(update.count), people: JSON.stringify(update.people) },

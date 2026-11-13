@@ -84,6 +84,17 @@ class LiveFeed:
         self.connection = None
 
 
+# the public page only ever gets this version: blocks this big leave a face as 1-2 solid squares
+PIXEL_BLOCK_SIZE = 20
+
+
+def pixelated_jpeg(frame):
+    frame_height, frame_width = frame.shape[:2]
+    small = cv2.resize(frame, (max(1, frame_width // PIXEL_BLOCK_SIZE), max(1, frame_height // PIXEL_BLOCK_SIZE)), interpolation=cv2.INTER_AREA)
+    blocky = cv2.resize(small, (frame_width, frame_height), interpolation=cv2.INTER_NEAREST)
+    return cv2.imencode(".jpg", blocky, [cv2.IMWRITE_JPEG_QUALITY, 70])[1].tobytes()
+
+
 def build_update(frame, people, jpeg):
     frame_height, frame_width = frame.shape[:2]
     return {
@@ -91,7 +102,8 @@ def build_update(frame, people, jpeg):
         "frame_width": frame_width,
         "frame_height": frame_height,
         "count": len(people),
-        "jpeg": base64.b64encode(jpeg).decode("ascii"),
+        "jpeg": base64.b64encode(pixelated_jpeg(frame)).decode("ascii"),  # broadcast to the public page
+        "raw_jpeg": base64.b64encode(jpeg).decode("ascii"),  # archived to r2 only (token-protected), never broadcast
         "people": [{"box": [x1, y1, x2, y2], "confidence": round(confidence, 3)} for x1, y1, x2, y2, confidence in people],
     }
 
