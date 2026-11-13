@@ -5,6 +5,7 @@ const BASE_PATH = "/lunch-line-monitor";
 const ROLE_HEADER = "x-lunch-line-role";
 // one history row per 2 s keeps writes (~43k/day) under the free plan's 100k sqlite rows written per day
 const RECORD_INTERVAL_MILLISECONDS = 2000;
+const MAXIMUM_FEEDBACK_CHARACTERS = 2000;
 
 // one durable object fans camera updates out to every open browser over hibernatable websockets
 export class LunchLine extends DurableObject {
@@ -15,12 +16,22 @@ export class LunchLine extends DurableObject {
     this.lastRecordedAt = 0;
     const sql = this.ctx.storage.sql;
     sql.exec("CREATE TABLE IF NOT EXISTS history (recorded_at INTEGER PRIMARY KEY, count INTEGER NOT NULL, people TEXT NOT NULL)");
+    sql.exec("CREATE TABLE IF NOT EXISTS feedback (submitted_at INTEGER NOT NULL, message TEXT NOT NULL)");
   }
 
   history(sinceMilliseconds) {
     return this.ctx.storage.sql
       .exec("SELECT recorded_at, count, people FROM history WHERE recorded_at >= ? ORDER BY recorded_at", sinceMilliseconds)
       .toArray();
+  }
+
+  // anonymous: only the time and the text are kept
+  addFeedback(message) {
+    this.ctx.storage.sql.exec("INSERT INTO feedback (submitted_at, message) VALUES (?, ?)", Date.now(), message);
+  }
+
+  feedback() {
+    return this.ctx.storage.sql.exec("SELECT submitted_at, message FROM feedback ORDER BY submitted_at DESC").toArray();
   }
 
   async fetch(request) {
@@ -102,6 +113,21 @@ export default {
     const path = url.pathname.replace(/\/+$/, "");
 
     if (path === `${BASE_PATH}/history`) return historyResponse(url, env);
+
+    // POST {"message": "..."} from the page's feedback box. GET lists it all, newest first, with the bearer token
+    if (path === `${BASE_PATH}/feedback`) {
+      if (request.method === "POST") {
+        const message = String((await request.json()).message ?? "").trim();
+        if (message === "" || message.length > MAXIMUM_FEEDBACK_CHARACTERS) {
+          return new Response(`feedback must be 1 to ${MAXIMUM_FEEDBACK_CHARACTERS} characters`, { status: 400 });
+        }
+        await lunchLineFor(env).addFeedback(message);
+        return new Response(null, { status: 204 });
+      }
+      if (!(await bearerTokenMatches(request.headers.get("Authorization"), env.INGEST_TOKEN))) return new Response("unauthorized", { status: 401 });
+      const rows = await lunchLineFor(env).feedback();
+      return Response.json(rows.map((row) => ({ pacific_time: pacificTime(row.submitted_at), message: row.message })), { headers: { "cache-control": "no-store" } });
+    }
 
     if (path === BASE_PATH) {
       return new Response(page, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache" } });

@@ -68,6 +68,14 @@
   body.offline .count, body.offline .count-label { opacity: 0.35; }  /* a stale count must not read as current */
   .frame-empty { position: absolute; inset: 0; display: grid; place-items: center; font-family: var(--mono); font-size: 14px; color: var(--ink-faint); }
   .footnote { font-size: 13px; line-height: 1.5; color: var(--ink-faint); max-width: 52ch; }
+  .feedback { display: flex; flex-direction: column; gap: var(--unit); }
+  .feedback-title { font-family: var(--mono); font-size: 13px; color: var(--ink-soft); }
+  .feedback textarea { width: 100%; min-height: 72px; resize: vertical; background: var(--frame-floor); color: var(--ink); border: 1px solid var(--frame-line); border-radius: 6px; padding: var(--unit); font: 14px var(--sans); }
+  .feedback textarea::placeholder { color: var(--ink-faint); }
+  .feedback-row { display: flex; align-items: center; gap: calc(var(--unit) * 1.5); }
+  .feedback button { background: var(--ink); color: var(--field); border: 0; border-radius: 6px; padding: 6px 14px; font: 600 13px var(--mono); cursor: pointer; }
+  .feedback button:disabled { opacity: 0.5; cursor: default; }
+  .feedback-status { font-family: var(--mono); font-size: 13px; color: var(--ink-soft); }
   .trend { display: flex; flex-direction: column; gap: var(--unit); }
   .trend-title { font-family: var(--mono); font-size: 13px; color: var(--ink-soft); }
   .trend svg { width: 100%; height: auto; display: block; overflow: visible; }
@@ -91,6 +99,11 @@
     <svg id="trend" viewBox="0 0 720 200" role="img" aria-label="people in view over the last 90 minutes"></svg>
   </div>
   <div class="frame" id="frame"><img id="frame-image" alt=""><div class="frame-empty" id="frame-empty">waiting for the camera</div></div>
+  <form class="feedback" id="feedback-form">
+    <label class="feedback-title" for="feedback-message">feedback? ideas, bugs, wrong counts (anonymous)</label>
+    <textarea id="feedback-message" maxlength="2000" placeholder="tell the socratica club what you think"></textarea>
+    <div class="feedback-row"><button type="submit" id="feedback-send">send</button><span class="feedback-status" id="feedback-status"></span></div>
+  </form>
   <p class="footnote">a camera by the lunch line counts people on a raspberry pi. <a href="/lunch-line-monitor/history?hours=168" style="color: inherit">download the count history (csv, last 7 days)</a></p>
 </main>
 <script>
@@ -254,6 +267,37 @@
     if (path) parts.push(`<path class="smoothed" d="${path}"/>`);
     trendSvg.innerHTML = parts.join("");
   }
+
+  const feedbackElements = {
+    form: document.getElementById("feedback-form"),
+    message: document.getElementById("feedback-message"),
+    send: document.getElementById("feedback-send"),
+    status: document.getElementById("feedback-status"),
+  };
+
+  async function sendFeedback(message) {
+    feedbackElements.send.disabled = true;
+    feedbackElements.status.textContent = "sending…";
+    try {
+      const response = await fetch("/lunch-line-monitor/feedback", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      feedbackElements.message.value = "";
+      feedbackElements.status.textContent = "thanks, got it";
+    } catch (error) {
+      feedbackElements.status.textContent = `didn't send: ${error.message}`;
+    } finally {
+      feedbackElements.send.disabled = false;
+    }
+  }
+
+  feedbackElements.form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (feedbackElements.message.value.trim()) sendFeedback(feedbackElements.message.value);
+  });
 
   connect();
   setInterval(renderStatus, 1000);
