@@ -5,6 +5,7 @@ workers_dev = false
 routes = [{ pattern = "nuevasocratica.com/lunch-line-monitor*", zone_name = "nuevasocratica.com" }]
 
 # INGEST_TOKEN is a secret (wrangler secret put INGEST_TOKEN); the pi sends it as a bearer token
+# DISCORD_FEEDBACK_WEBHOOK_URL is a secret too (1password "socratica discord feedback webhook"): each feedback post goes to #feedback in the socratica discord
 
 [[durable_objects.bindings]]
 name = "LUNCH_LINE"

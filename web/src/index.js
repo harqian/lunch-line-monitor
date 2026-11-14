@@ -82,6 +82,22 @@ function pacificTime(milliseconds) {
   return new Date(milliseconds).toLocaleString("sv-SE", { timeZone: "America/Los_Angeles" });
 }
 
+// posts one feedback submission to #feedback in the socratica discord through a channel webhook.
+// runs after the feedback is already stored, so a discord failure only shows in the worker logs
+async function notifyDiscord(env, message) {
+  if (!env.DISCORD_FEEDBACK_WEBHOOK_URL) throw new Error("DISCORD_FEEDBACK_WEBHOOK_URL secret is not set");
+  const response = await fetch(env.DISCORD_FEEDBACK_WEBHOOK_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      // the text is anonymous public input: an embed plus no allowed mentions keeps it from pinging @everyone or anyone else
+      embeds: [{ title: "new lunch line monitor feedback", description: message, timestamp: new Date().toISOString(), url: "https://nuevasocratica.com/lunch-line-monitor" }],
+      allowed_mentions: { parse: [] },
+    }),
+  });
+  if (!response.ok) throw new Error(`discord webhook answered ${response.status}: ${(await response.text()).slice(0, 300)}`);
+}
+
 function lunchLineFor(env) {
   return env.LUNCH_LINE.get(env.LUNCH_LINE.idFromName("nueva-lunch-line"));
 }
@@ -108,7 +124,7 @@ async function historyResponse(url, env) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, "");
 
@@ -122,6 +138,7 @@ export default {
           return new Response(`feedback must be 1 to ${MAXIMUM_FEEDBACK_CHARACTERS} characters`, { status: 400 });
         }
         await lunchLineFor(env).addFeedback(message);
+        ctx.waitUntil(notifyDiscord(env, message));
         return new Response(null, { status: 204 });
       }
       if (!(await bearerTokenMatches(request.headers.get("Authorization"), env.INGEST_TOKEN))) return new Response("unauthorized", { status: 401 });
