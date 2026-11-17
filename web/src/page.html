@@ -67,6 +67,7 @@
   .frame-empty { position: absolute; inset: 0; display: grid; place-items: center; font-family: var(--mono); font-size: 14px; color: var(--ink-faint); }
   .disclaimer { margin: 0; font-size: 13px; line-height: 1.5; color: var(--ink-soft); max-width: 60ch; }
   .footnote { font-size: 13px; line-height: 1.5; color: var(--ink-faint); max-width: 52ch; }
+  .pi-health { margin: 0; font-family: var(--mono); font-size: 11px; color: var(--ink-faint); }
   .feedback { display: flex; flex-direction: column; gap: var(--unit); }
   .feedback-title { font-family: var(--mono); font-size: 13px; color: var(--ink-soft); }
   .feedback textarea { width: 100%; min-height: 72px; resize: vertical; background: var(--frame-floor); color: var(--ink); border: 1px solid var(--frame-line); border-radius: 6px; padding: var(--unit); font: 14px var(--sans); }
@@ -105,6 +106,7 @@
     <div class="feedback-row"><button type="submit" id="feedback-send">send</button><span class="feedback-status" id="feedback-status"></span></div>
   </form>
   <p class="footnote">a camera by the lunch line counts people on a raspberry pi. <a href="/lunch-line-monitor/history?hours=168" style="color: inherit">download the count history (csv, last 7 days)</a></p>
+  <p class="pi-health" id="pi-health"></p>
 </main>
 <script>
   const STALE_AFTER_MILLISECONDS = 15000;
@@ -115,6 +117,7 @@
     frame: document.getElementById("frame"),
     frameEmpty: document.getElementById("frame-empty"),
     frameImage: document.getElementById("frame-image"),
+    piHealth: document.getElementById("pi-health"),
   };
   let latestUpdate = null;
   let socketOpen = false;
@@ -138,7 +141,9 @@
       elements.statusText.textContent = `camera offline · last seen ${describeAge(age)}`;
     } else {
       document.body.classList.add("live");
-      elements.statusText.textContent = `live · updated ${describeAge(age)}`;
+      // the image comes every second; the count only every ~30 s, when the pi has finished counting a frame
+      const countAge = latestUpdate.counted_at ? ` · count from ${describeAge(Date.now() - latestUpdate.counted_at * 1000)}` : "";
+      elements.statusText.textContent = `live · image ${describeAge(age)}${countAge}`;
     }
   }
 
@@ -156,6 +161,7 @@
       elements.frameEmpty.style.display = "";
       elements.frameImage.style.display = "none";
     }
+    elements.piHealth.textContent = typeof update.cpu_temperature_celsius === "number" ? `raspberry pi cpu ${update.cpu_temperature_celsius.toFixed(0)}°c` : "";
     addTrendReading(update);
     renderStatus();
   }

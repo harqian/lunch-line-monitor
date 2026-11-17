@@ -5,15 +5,21 @@
 
 reads the ingest token from the LUNCH_LINE_INGEST_TOKEN environment variable.
 each update carries the estimated count and a pixelated jpeg. the raw frame never leaves the pi.
+the pixelated image goes out every --seconds-between-updates (1 s); the crowd count (~13 s of full cpu on the pi 4)
+runs in a background thread with rests in between, so the pi stays below its thermal throttle (it sat at 82 c and had
+throttled when counting nonstop, 11/16).
 """
 import argparse
 import base64
 import json
 import os
+import threading
 import time
+from pathlib import Path
 
 import cv2
 import numpy
+import torch
 from websockets.exceptions import InvalidStatus, WebSocketException
 from websockets.sync.client import connect
 
@@ -22,6 +28,20 @@ import detect_people as detection  # webcam helpers only
 
 INGEST_URL = "wss://nuevasocratica.com/lunch-line-monitor/ingest"
 MAX_CONSECUTIVE_BAD_FRAMES = 10
+CPU_TEMPERATURE_PATH = Path("/sys/class/thermal/thermal_zone0/temp")
+# counting threads: one of the pi's 4 cores stays free for capture + pixelation, so image updates keep flowing
+COUNTING_THREADS = 3
+# after each count, rest this many times as long as the count took (1.0 = counting half the time)
+REST_PER_SECOND_COUNTING = 1.0
+# the pi 4 starts throttling at 80 c; pause counting at 75 and resume once it is back under 70
+PAUSE_COUNTING_AT_CELSIUS = 75.0
+RESUME_COUNTING_AT_CELSIUS = 70.0
+# a block of the 14 px grid counts as changed when its gray level moves this much (0-255); camera noise stays well under it
+CHANGED_BLOCK_LEVELS = 12
+# below this share of changed blocks the scene is the same (empty hall, night), so the last count is reused
+CHANGED_BLOCK_SHARE_TO_RECOUNT = 0.005
+# recount anyway after this long, so slow lighting drift can't freeze a wrong count
+MAXIMUM_COUNT_AGE_SECONDS = 300
 
 
 class WebcamSource:
@@ -89,20 +109,91 @@ class LiveFeed:
 PIXEL_BLOCK_SIZE = 14
 
 
+def block_grid(frame):
+    frame_height, frame_width = frame.shape[:2]
+    return cv2.resize(frame, (max(1, frame_width // PIXEL_BLOCK_SIZE), max(1, frame_height // PIXEL_BLOCK_SIZE)), interpolation=cv2.INTER_AREA)
+
+
 def pixelated_jpeg(frame):
     frame_height, frame_width = frame.shape[:2]
-    small = cv2.resize(frame, (max(1, frame_width // PIXEL_BLOCK_SIZE), max(1, frame_height // PIXEL_BLOCK_SIZE)), interpolation=cv2.INTER_AREA)
+    small = block_grid(frame)
     blocky = cv2.resize(small, (frame_width, frame_height), interpolation=cv2.INTER_NEAREST)
     return cv2.imencode(".jpg", blocky, [cv2.IMWRITE_JPEG_QUALITY, 70])[1].tobytes()
 
 
-def build_update(frame, crowd_estimate):
+def cpu_temperature_celsius():
+    """none off the pi (a laptop webcam run), where the page just hides the readout."""
+    if not CPU_TEMPERATURE_PATH.exists():
+        return None
+    return int(CPU_TEMPERATURE_PATH.read_text()) / 1000
+
+
+class BackgroundCounter:
+    """counts the newest frame in its own thread, resting between counts and pausing when the cpu runs hot."""
+
+    def __init__(self, counter):
+        self.counter = counter
+        self.lock = threading.Lock()
+        self.newest_frame = None
+        self.estimate = None
+        self.counted_at = None
+        self.counted_grid = None
+        self.first_count_done = threading.Event()
+        threading.Thread(target=self.count_forever, daemon=True).start()
+
+    def offer(self, frame):
+        with self.lock:
+            self.newest_frame = frame
+
+    def latest(self):
+        with self.lock:
+            return self.estimate, self.counted_at
+
+    def scene_changed(self, grid):
+        if self.counted_grid is None or time.time() - self.counted_at > MAXIMUM_COUNT_AGE_SECONDS:
+            return True
+        difference = cv2.absdiff(cv2.cvtColor(grid, cv2.COLOR_BGR2GRAY), cv2.cvtColor(self.counted_grid, cv2.COLOR_BGR2GRAY))
+        return (difference > CHANGED_BLOCK_LEVELS).mean() >= CHANGED_BLOCK_SHARE_TO_RECOUNT
+
+    def wait_until_cool(self):
+        temperature = cpu_temperature_celsius()
+        if temperature is None or temperature < PAUSE_COUNTING_AT_CELSIUS:
+            return
+        print(f"cpu at {temperature:.1f} c, counting paused until it is under {RESUME_COUNTING_AT_CELSIUS:.0f} c", flush=True)
+        while cpu_temperature_celsius() >= RESUME_COUNTING_AT_CELSIUS:
+            time.sleep(5)
+
+    def count_forever(self):
+        while True:
+            with self.lock:
+                frame = self.newest_frame
+            if frame is None:
+                time.sleep(0.2)
+                continue
+            grid = block_grid(frame)
+            if not self.scene_changed(grid):
+                time.sleep(2)
+                continue
+            self.wait_until_cool()
+            started = time.monotonic()
+            estimate = crowd_count.count_people(self.counter, frame)
+            seconds_counting = time.monotonic() - started
+            with self.lock:
+                self.estimate, self.counted_at, self.counted_grid = estimate, time.time(), grid
+            self.first_count_done.set()
+            print(f"{estimate:.1f} people estimated ({seconds_counting:.1f}s, cpu {cpu_temperature_celsius()} c)", flush=True)
+            time.sleep(seconds_counting * REST_PER_SECOND_COUNTING)
+
+
+def build_update(frame, crowd_estimate, counted_at):
     frame_height, frame_width = frame.shape[:2]
     return {
         "captured_at": time.time(),
         "frame_width": frame_width,
         "frame_height": frame_height,
         "count": round(crowd_estimate),
+        "counted_at": counted_at,  # the count lags the image: it comes from the newest frame the background counter finished
+        "cpu_temperature_celsius": cpu_temperature_celsius(),
         # the raw frame never leaves the pi; the site only shows a jpeg marked with its pixel_block_size
         "jpeg": base64.b64encode(pixelated_jpeg(frame)).decode("ascii"),
         "pixel_block_size": PIXEL_BLOCK_SIZE,
@@ -110,7 +201,7 @@ def build_update(frame, crowd_estimate):
     }
 
 
-def run(source, counter, feed, seconds_between_updates, frame_path):
+def run(source, background_counter, feed, seconds_between_updates, frame_path):
     consecutive_bad_frames = 0
     while True:
         started = time.monotonic()
@@ -123,12 +214,13 @@ def run(source, counter, feed, seconds_between_updates, frame_path):
                 raise
             continue
         consecutive_bad_frames = 0
-        crowd_estimate = crowd_count.count_people(counter, frame)
-        feed.send(build_update(frame, crowd_estimate))
+        background_counter.offer(frame)
         if frame_path:
             cv2.imwrite(frame_path, frame)
+        # the worker requires a numeric count, so nothing goes out until the first count is in (~15 s after start)
+        if background_counter.first_count_done.is_set():
+            feed.send(build_update(frame, *background_counter.latest()))
         elapsed = time.monotonic() - started
-        print(f"{crowd_estimate:.1f} people estimated ({elapsed:.2f}s)", flush=True)
         time.sleep(max(0.0, seconds_between_updates - elapsed))
 
 
@@ -137,14 +229,15 @@ def main():
     parser.add_argument("--source", choices=["arducam", "webcam"], required=True)
     parser.add_argument("--camera", type=int, default=0, help="opencv camera index for --source webcam")
     parser.add_argument("--resolution", default="640x480", help="arducam jpeg size, e.g. 320x240, 640x480, 800x600")
-    parser.add_argument("--seconds-between-updates", type=float, default=0.0, help="0 = as fast as capture + counting allow")
+    parser.add_argument("--seconds-between-updates", type=float, default=1.0, help="how often the pixelated image goes out; counting runs on its own schedule")
     parser.add_argument("--save-annotated", help="overwrite this local image with the latest raw frame (for aiming the camera; never leaves the pi)")
     parser.add_argument("--url", default=INGEST_URL)
     arguments = parser.parse_args()
 
     token = os.environ["LUNCH_LINE_INGEST_TOKEN"]
     source = ArducamSource(arguments.resolution) if arguments.source == "arducam" else WebcamSource(arguments.camera)
-    run(source, crowd_count.load_counter(), LiveFeed(arguments.url, token), arguments.seconds_between_updates, arguments.save_annotated)
+    torch.set_num_threads(COUNTING_THREADS)
+    run(source, BackgroundCounter(crowd_count.load_counter()), LiveFeed(arguments.url, token), arguments.seconds_between_updates, arguments.save_annotated)
 
 
 if __name__ == "__main__":
