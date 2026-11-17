@@ -17,6 +17,7 @@ import numpy
 from websockets.exceptions import InvalidStatus, WebSocketException
 from websockets.sync.client import connect
 
+import crowd_count
 import detect_people as detection
 
 INGEST_URL = "wss://nuevasocratica.com/lunch-line-monitor/ingest"
@@ -84,8 +85,8 @@ class LiveFeed:
         self.connection = None
 
 
-# the public page only ever gets this version: blocks this big leave a face as 1-2 solid squares
-PIXEL_BLOCK_SIZE = 20
+# the public page only ever gets this version: 14 px = a 45x34 grid on a 640x480 frame (was 20 until 11/16)
+PIXEL_BLOCK_SIZE = 14
 
 
 def pixelated_jpeg(frame):
@@ -95,13 +96,15 @@ def pixelated_jpeg(frame):
     return cv2.imencode(".jpg", blocky, [cv2.IMWRITE_JPEG_QUALITY, 70])[1].tobytes()
 
 
-def build_update(frame, people):
+def build_update(frame, people, crowd_estimate):
     frame_height, frame_width = frame.shape[:2]
     return {
         "captured_at": time.time(),
         "frame_width": frame_width,
         "frame_height": frame_height,
-        "count": len(people),
+        # yolo boxes undercount crowds (it only sees unoccluded people); the count comes from the density model
+        "count": round(crowd_estimate),
+        "detected_count": len(people),
         # the raw frame never leaves the pi; the site only shows a jpeg marked with its pixel_block_size
         "jpeg": base64.b64encode(pixelated_jpeg(frame)).decode("ascii"),
         "pixel_block_size": PIXEL_BLOCK_SIZE,
@@ -109,7 +112,7 @@ def build_update(frame, people):
     }
 
 
-def run(source, model, feed, confidence_threshold, device, image_size, seconds_between_updates, annotated_path):
+def run(source, model, counter, feed, confidence_threshold, device, image_size, seconds_between_updates, annotated_path):
     consecutive_bad_frames = 0
     while True:
         started = time.monotonic()
@@ -123,11 +126,12 @@ def run(source, model, feed, confidence_threshold, device, image_size, seconds_b
             continue
         consecutive_bad_frames = 0
         people = detection.detect_people(model, frame, confidence_threshold, device, image_size)
-        feed.send(build_update(frame, people))
+        crowd_estimate = crowd_count.count_people(counter, frame)
+        feed.send(build_update(frame, people, crowd_estimate))
         if annotated_path:
             cv2.imwrite(annotated_path, detection.draw_people(frame, people))
         elapsed = time.monotonic() - started
-        print(f"{len(people)} people ({elapsed:.2f}s)", flush=True)
+        print(f"{crowd_estimate:.1f} people estimated, {len(people)} boxes ({elapsed:.2f}s)", flush=True)
         time.sleep(max(0.0, seconds_between_updates - elapsed))
 
 
@@ -148,7 +152,7 @@ def main():
     device = detection.pick_device()
     model = detection.load_model(arguments.model)
     source = ArducamSource(arguments.resolution) if arguments.source == "arducam" else WebcamSource(arguments.camera)
-    run(source, model, LiveFeed(arguments.url, token), arguments.confidence, device, arguments.image_size, arguments.seconds_between_updates, arguments.save_annotated)
+    run(source, model, crowd_count.load_counter(), LiveFeed(arguments.url, token), arguments.confidence, device, arguments.image_size, arguments.seconds_between_updates, arguments.save_annotated)
 
 
 if __name__ == "__main__":

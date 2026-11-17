@@ -95,7 +95,7 @@
     <div class="count-label" id="count-label">people detected</div>
   </div>
   <div class="status"><span class="pulse"></span><span id="status-text">connecting…</span></div>
-  <p class="disclaimer">this is a computer vision estimate, not a headcount. people standing close together or behind someone else get missed, so the real line is almost always longer than this number. read it as a gauge of line length: higher means longer.</p>
+  <p class="disclaimer">this is a computer vision estimate, not a headcount. the boxes are people the camera can pick out one by one; the number comes from a crowd-counting model that also counts people who are partly hidden, so it is usually bigger than the number of boxes. read it as a gauge of line length: higher means longer.</p>
   <div class="trend">
     <div class="trend-title">last 90 min · dots = each reading, line = 2 min average</div>
     <svg id="trend" viewBox="0 0 720 200" role="img" aria-label="people detected over the last 90 minutes"></svg>
