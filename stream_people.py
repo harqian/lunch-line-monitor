@@ -29,13 +29,13 @@ import detect_people as detection  # webcam helpers only
 INGEST_URL = "wss://nuevasocratica.com/lunch-line-monitor/ingest"
 MAX_CONSECUTIVE_BAD_FRAMES = 10
 CPU_TEMPERATURE_PATH = Path("/sys/class/thermal/thermal_zone0/temp")
-# counting threads: one of the pi's 4 cores stays free for capture + pixelation, so image updates keep flowing
-COUNTING_THREADS = 3
+# counting threads: 2 of the pi's 4 cores. 3 took the cpu from 70 to 82 c in one 12 s count (throttle starts at 80);
+# fewer threads = less heat per second, and capture + pixelation keep a free core
+COUNTING_THREADS = 2
 # after each count, rest this many times as long as the count took (1.0 = counting half the time)
 REST_PER_SECOND_COUNTING = 1.0
-# the pi 4 starts throttling at 80 c; pause counting at 75 and resume once it is back under 70
-PAUSE_COUNTING_AT_CELSIUS = 75.0
-RESUME_COUNTING_AT_CELSIUS = 70.0
+# the pi 4 throttles at 80 c and one count adds ~10 c, so a count only starts once the cpu is under this
+START_COUNTING_BELOW_CELSIUS = 68.0
 # a block of the 14 px grid counts as changed when its gray level moves this much (0-255); camera noise stays well under it
 CHANGED_BLOCK_LEVELS = 12
 # below this share of changed blocks the scene is the same (empty hall, night), so the last count is reused
@@ -149,19 +149,18 @@ class BackgroundCounter:
         with self.lock:
             return self.estimate, self.counted_at
 
-    def scene_changed(self, grid):
+    def changed_block_share(self, grid):
+        """share of grid blocks that changed since the last count; 1.0 when there is none or it is too old."""
         if self.counted_grid is None or time.time() - self.counted_at > MAXIMUM_COUNT_AGE_SECONDS:
-            return True
+            return 1.0
         difference = cv2.absdiff(cv2.cvtColor(grid, cv2.COLOR_BGR2GRAY), cv2.cvtColor(self.counted_grid, cv2.COLOR_BGR2GRAY))
-        return (difference > CHANGED_BLOCK_LEVELS).mean() >= CHANGED_BLOCK_SHARE_TO_RECOUNT
+        return float((difference > CHANGED_BLOCK_LEVELS).mean())
 
     def wait_until_cool(self):
         temperature = cpu_temperature_celsius()
-        if temperature is None or temperature < PAUSE_COUNTING_AT_CELSIUS:
-            return
-        print(f"cpu at {temperature:.1f} c, counting paused until it is under {RESUME_COUNTING_AT_CELSIUS:.0f} c", flush=True)
-        while cpu_temperature_celsius() >= RESUME_COUNTING_AT_CELSIUS:
-            time.sleep(5)
+        while temperature is not None and temperature >= START_COUNTING_BELOW_CELSIUS:
+            time.sleep(2)
+            temperature = cpu_temperature_celsius()
 
     def count_forever(self):
         while True:
@@ -171,7 +170,8 @@ class BackgroundCounter:
                 time.sleep(0.2)
                 continue
             grid = block_grid(frame)
-            if not self.scene_changed(grid):
+            changed_share = self.changed_block_share(grid)
+            if changed_share < CHANGED_BLOCK_SHARE_TO_RECOUNT:
                 time.sleep(2)
                 continue
             self.wait_until_cool()
@@ -181,7 +181,7 @@ class BackgroundCounter:
             with self.lock:
                 self.estimate, self.counted_at, self.counted_grid = estimate, time.time(), grid
             self.first_count_done.set()
-            print(f"{estimate:.1f} people estimated ({seconds_counting:.1f}s, cpu {cpu_temperature_celsius()} c)", flush=True)
+            print(f"{estimate:.1f} people estimated ({seconds_counting:.1f}s, {changed_share:.1%} of blocks changed, cpu {cpu_temperature_celsius()} c)", flush=True)
             time.sleep(seconds_counting * REST_PER_SECOND_COUNTING)
 
 
