@@ -1,10 +1,10 @@
-"""camera -> person detection -> live update on nuevasocratica.com/lunch-line-monitor.
+"""camera -> crowd count -> live update on nuevasocratica.com/lunch-line-monitor.
 
   uv run stream_people.py --source arducam            # on the pi, arducam mini 2mp plus on spi + i2c
   uv run stream_people.py --source webcam --camera 0  # any opencv camera (how the pipeline was tested from a laptop)
 
 reads the ingest token from the LUNCH_LINE_INGEST_TOKEN environment variable.
-each update carries a pixelated jpeg plus the person boxes, drawn on the page. the raw frame never leaves the pi.
+each update carries the estimated count and a pixelated jpeg. the raw frame never leaves the pi.
 """
 import argparse
 import base64
@@ -18,7 +18,7 @@ from websockets.exceptions import InvalidStatus, WebSocketException
 from websockets.sync.client import connect
 
 import crowd_count
-import detect_people as detection
+import detect_people as detection  # webcam helpers only
 
 INGEST_URL = "wss://nuevasocratica.com/lunch-line-monitor/ingest"
 MAX_CONSECUTIVE_BAD_FRAMES = 10
@@ -96,23 +96,21 @@ def pixelated_jpeg(frame):
     return cv2.imencode(".jpg", blocky, [cv2.IMWRITE_JPEG_QUALITY, 70])[1].tobytes()
 
 
-def build_update(frame, people, crowd_estimate):
+def build_update(frame, crowd_estimate):
     frame_height, frame_width = frame.shape[:2]
     return {
         "captured_at": time.time(),
         "frame_width": frame_width,
         "frame_height": frame_height,
-        # yolo boxes undercount crowds (it only sees unoccluded people); the count comes from the density model
         "count": round(crowd_estimate),
-        "detected_count": len(people),
         # the raw frame never leaves the pi; the site only shows a jpeg marked with its pixel_block_size
         "jpeg": base64.b64encode(pixelated_jpeg(frame)).decode("ascii"),
         "pixel_block_size": PIXEL_BLOCK_SIZE,
-        "people": [{"box": [x1, y1, x2, y2], "confidence": round(confidence, 3)} for x1, y1, x2, y2, confidence in people],
+        "people": [],  # no per-person boxes since 11/16: yolo only found unoccluded people and topped out ~10
     }
 
 
-def run(source, model, counter, feed, confidence_threshold, device, image_size, seconds_between_updates, annotated_path):
+def run(source, counter, feed, seconds_between_updates, frame_path):
     consecutive_bad_frames = 0
     while True:
         started = time.monotonic()
@@ -125,13 +123,12 @@ def run(source, model, counter, feed, confidence_threshold, device, image_size, 
                 raise
             continue
         consecutive_bad_frames = 0
-        people = detection.detect_people(model, frame, confidence_threshold, device, image_size)
         crowd_estimate = crowd_count.count_people(counter, frame)
-        feed.send(build_update(frame, people, crowd_estimate))
-        if annotated_path:
-            cv2.imwrite(annotated_path, detection.draw_people(frame, people))
+        feed.send(build_update(frame, crowd_estimate))
+        if frame_path:
+            cv2.imwrite(frame_path, frame)
         elapsed = time.monotonic() - started
-        print(f"{crowd_estimate:.1f} people estimated, {len(people)} boxes ({elapsed:.2f}s)", flush=True)
+        print(f"{crowd_estimate:.1f} people estimated ({elapsed:.2f}s)", flush=True)
         time.sleep(max(0.0, seconds_between_updates - elapsed))
 
 
@@ -140,19 +137,14 @@ def main():
     parser.add_argument("--source", choices=["arducam", "webcam"], required=True)
     parser.add_argument("--camera", type=int, default=0, help="opencv camera index for --source webcam")
     parser.add_argument("--resolution", default="640x480", help="arducam jpeg size, e.g. 320x240, 640x480, 800x600")
-    parser.add_argument("--model", default=str(detection.DEFAULT_MODEL_PATH))
-    parser.add_argument("--confidence", type=float, default=0.4)
-    parser.add_argument("--image-size", type=int, default=416, help="detection input size; 416 is ~0.42 s on a pi 4, 320 ~0.27 s, 640 ~0.9 s")
-    parser.add_argument("--seconds-between-updates", type=float, default=0.0, help="0 = as fast as capture + detection allow")
-    parser.add_argument("--save-annotated", help="overwrite this image with the latest annotated frame (for aiming the camera)")
+    parser.add_argument("--seconds-between-updates", type=float, default=0.0, help="0 = as fast as capture + counting allow")
+    parser.add_argument("--save-annotated", help="overwrite this local image with the latest raw frame (for aiming the camera; never leaves the pi)")
     parser.add_argument("--url", default=INGEST_URL)
     arguments = parser.parse_args()
 
     token = os.environ["LUNCH_LINE_INGEST_TOKEN"]
-    device = detection.pick_device()
-    model = detection.load_model(arguments.model)
     source = ArducamSource(arguments.resolution) if arguments.source == "arducam" else WebcamSource(arguments.camera)
-    run(source, model, crowd_count.load_counter(), LiveFeed(arguments.url, token), arguments.confidence, device, arguments.image_size, arguments.seconds_between_updates, arguments.save_annotated)
+    run(source, crowd_count.load_counter(), LiveFeed(arguments.url, token), arguments.seconds_between_updates, arguments.save_annotated)
 
 
 if __name__ == "__main__":

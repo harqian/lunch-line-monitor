@@ -62,9 +62,7 @@
     overflow: hidden;
   }
   .frame img { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
-  .box { position: absolute; border: 2px solid #3cff7a; border-radius: 3px; transition: left 150ms linear, top 150ms linear, width 150ms linear, height 150ms linear; }
-  .box span { position: absolute; left: -2px; top: -20px; background: #3cff7a; color: #002a10; font: 600 11px var(--mono); padding: 2px 4px; border-radius: 3px 3px 0 0; }
-  body.offline .frame img, body.offline .box { opacity: 0.35; }
+  body.offline .frame img { opacity: 0.35; }
   body.offline .count, body.offline .count-label { opacity: 0.35; }  /* a stale count must not read as current */
   .frame-empty { position: absolute; inset: 0; display: grid; place-items: center; font-family: var(--mono); font-size: 14px; color: var(--ink-faint); }
   .disclaimer { margin: 0; font-size: 13px; line-height: 1.5; color: var(--ink-soft); max-width: 60ch; }
@@ -95,7 +93,7 @@
     <div class="count-label" id="count-label">people detected</div>
   </div>
   <div class="status"><span class="pulse"></span><span id="status-text">connecting…</span></div>
-  <p class="disclaimer">this is a computer vision estimate, not a headcount. the boxes are people the camera can pick out one by one; the number comes from a crowd-counting model that also counts people who are partly hidden, so it is usually bigger than the number of boxes. read it as a gauge of line length: higher means longer.</p>
+  <p class="disclaimer">this is a computer vision estimate, not a headcount. a crowd-counting model estimates how many people are in view, including people who are partly hidden. read it as a gauge of line length: higher means longer.</p>
   <div class="trend">
     <div class="trend-title">last 90 min · dots = each reading, line = 2 min average</div>
     <svg id="trend" viewBox="0 0 720 200" role="img" aria-label="people detected over the last 90 minutes"></svg>
@@ -144,13 +142,6 @@
     }
   }
 
-  function makeBox() {
-    const box = document.createElement("div");
-    box.className = "box";
-    box.append(document.createElement("span"));
-    return box;
-  }
-
   function renderUpdate(update) {
     latestUpdate = update;
     elements.count.textContent = update.count;
@@ -165,17 +156,6 @@
       elements.frameEmpty.style.display = "";
       elements.frameImage.style.display = "none";
     }
-    const boxes = [...elements.frame.querySelectorAll(".box")];
-    update.people.forEach((person, index) => {
-      const box = boxes[index] ?? elements.frame.appendChild(makeBox());
-      box.firstChild.textContent = `person ${person.confidence.toFixed(2)}`;
-      const [x1, y1, x2, y2] = person.box;
-      box.style.left = `${(100 * x1) / update.frame_width}%`;
-      box.style.top = `${(100 * y1) / update.frame_height}%`;
-      box.style.width = `${(100 * (x2 - x1)) / update.frame_width}%`;
-      box.style.height = `${(100 * (y2 - y1)) / update.frame_height}%`;
-    });
-    boxes.slice(update.people.length).forEach((box) => box.remove());
     addTrendReading(update);
     renderStatus();
   }
