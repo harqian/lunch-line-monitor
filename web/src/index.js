@@ -123,12 +123,70 @@ async function historyResponse(url, env) {
   });
 }
 
+const API_HEADERS = { "cache-control": "no-store", "access-control-allow-origin": "*" };
+
+function isoTime(seconds) {
+  return seconds == null ? null : new Date(seconds * 1000).toISOString();
+}
+
+// GET /lunch-line-monitor/api/count (json) and /lunch-line-monitor/api/image.jpg (the pixelated frame), both public like the page.
+// 503 when the camera has sent nothing for 5 s
+// connects as a viewer and takes the first message: the object sends its latest update on connect, else the next camera update (~1 s).
+// uses only the websocket path, so it works even while an older durable object is still running after a deploy
+async function latestUpdateJson(env) {
+  const request = new Request("https://lunch-line-monitor.internal/live", { headers: { Upgrade: "websocket", [ROLE_HEADER]: "viewer" } });
+  const response = await lunchLineFor(env).fetch(request);
+  const socket = response.webSocket;
+  if (!socket) throw new Error(`durable object answered ${response.status} without a websocket`);
+  socket.accept();
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      socket.close(1000, "no update");
+      resolve(null);
+    }, 5000);
+    socket.addEventListener("message", (event) => {
+      clearTimeout(timer);
+      socket.close(1000, "done");
+      resolve(event.data);
+    });
+  });
+}
+
+async function apiResponse(path, env) {
+  const latestJson = await latestUpdateJson(env);
+  if (latestJson === null) return new Response("no camera update yet", { status: 503, headers: API_HEADERS });
+  const update = JSON.parse(latestJson);
+  if (path === `${BASE_PATH}/api/image.jpg`) {
+    if (typeof update.jpeg !== "string") return new Response("image hidden for privacy", { status: 404, headers: API_HEADERS });
+    const bytes = Uint8Array.from(atob(update.jpeg), (character) => character.charCodeAt(0));
+    return new Response(bytes, { headers: { ...API_HEADERS, "content-type": "image/jpeg" } });
+  }
+  const now = Date.now();
+  return Response.json(
+    {
+      count: update.count,
+      count_computed_at: isoTime(update.counted_at),
+      count_age_seconds: update.counted_at == null ? null : Math.round(now / 1000 - update.counted_at),
+      image_captured_at: isoTime(update.captured_at),
+      image_age_seconds: Math.round((now - update.received_at) / 1000),
+      image_url: `https://nuevasocratica.com${BASE_PATH}/api/image.jpg`,
+      pixel_block_size: update.pixel_block_size ?? null,
+      frame_width: update.frame_width,
+      frame_height: update.frame_height,
+      cpu_temperature_celsius: update.cpu_temperature_celsius ?? null,
+      note: "computer vision estimate from a crowd density model; it undercounts dense or occluded lines, so read it as a gauge of line length",
+    },
+    { headers: API_HEADERS }
+  );
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, "");
 
     if (path === `${BASE_PATH}/history`) return historyResponse(url, env);
+    if (path === `${BASE_PATH}/api/count` || path === `${BASE_PATH}/api/image.jpg`) return apiResponse(path, env);
 
     // POST {"message": "..."} from the page's feedback box. GET lists it all, newest first, with the bearer token
     if (path === `${BASE_PATH}/feedback`) {
