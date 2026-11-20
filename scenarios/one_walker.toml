@@ -1,0 +1,9 @@
+# one person walks left to right across the frame in 7 s, then nobody: the wait should read ~7 s and stay there
+seconds_per_update = 0.6
+
+[[people]]
+path = [[1, 0, 300], [8, 640, 300]]
+
+[[people]]
+# a second person a minute later, to see the estimate held while nobody was in view
+path = [[60, 0, 300], [67, 640, 300]]

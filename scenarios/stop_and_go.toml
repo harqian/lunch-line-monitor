@@ -1,0 +1,9 @@
+# people walk in, each stops for ~9 s on their own, then leaves; 20 s in view each. they pause independently,
+# mid-frame, with nobody waiting at the front, so it doesn't look like a line: the wait reads low here
+# (~10 s, walking time only): a known limit
+seconds_per_update = 0.6
+
+[[people]]
+path = [[0, 0, 300], [3, 280, 300], [12, 300, 300], [16, 560, 300], [20, 640, 300]]
+repeat_every = 6
+repeat_count = 10

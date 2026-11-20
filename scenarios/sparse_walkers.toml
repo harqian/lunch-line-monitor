@@ -1,0 +1,7 @@
+# a trickle: one walker every 25 s, each taking 7 s; the gap between arrivals must not leak into the wait
+seconds_per_update = 0.6
+
+[[people]]
+path = [[0, 0, 300], [7, 640, 300]]
+repeat_every = 25
+repeat_count = 6
