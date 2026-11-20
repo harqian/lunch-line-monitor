@@ -19,9 +19,15 @@ export class LunchLine extends DurableObject {
     this.latestUpdate = null;
     this.lastRecordedAt = 0;
     this.recentHistory = null;
-    const sql = this.ctx.storage.sql;
-    sql.exec("CREATE TABLE IF NOT EXISTS history (recorded_at INTEGER PRIMARY KEY, count INTEGER NOT NULL, people TEXT NOT NULL)");
-    sql.exec("CREATE TABLE IF NOT EXISTS feedback (submitted_at INTEGER NOT NULL, message TEXT NOT NULL)");
+    // the free plan's daily rows-read quota makes every sql call throw, even CREATE TABLE IF NOT EXISTS.
+    // a throw here would kill the object and with it the live feed (11/20), so storage failures only stop recording
+    try {
+      const sql = this.ctx.storage.sql;
+      sql.exec("CREATE TABLE IF NOT EXISTS history (recorded_at INTEGER PRIMARY KEY, count INTEGER NOT NULL, people TEXT NOT NULL)");
+      sql.exec("CREATE TABLE IF NOT EXISTS feedback (submitted_at INTEGER NOT NULL, message TEXT NOT NULL)");
+    } catch (error) {
+      console.error(`lunch line storage unavailable at startup: ${error}`);
+    }
   }
 
   history(sinceMilliseconds) {
@@ -74,12 +80,17 @@ export class LunchLine extends DurableObject {
     for (const viewer of this.ctx.getWebSockets("viewer")) viewer.send(this.latestUpdate);
     if (update.received_at - this.lastRecordedAt < RECORD_INTERVAL_MILLISECONDS) return;
     this.lastRecordedAt = update.received_at;
-    this.ctx.storage.sql.exec(
-      "INSERT OR REPLACE INTO history (recorded_at, count, people) VALUES (?, ?, ?)",
-      update.received_at,
-      update.count,
-      JSON.stringify(update.people)
-    );
+    try {
+      this.ctx.storage.sql.exec(
+        "INSERT OR REPLACE INTO history (recorded_at, count, people) VALUES (?, ?, ?)",
+        update.received_at,
+        update.count,
+        JSON.stringify(update.people)
+      );
+    } catch (error) {
+      console.error(`lunch line history row not recorded: ${error}`);
+      return;
+    }
     if (this.recentHistory !== null) {
       const recentSince = update.received_at - RECENT_HISTORY_MILLISECONDS;
       this.recentHistory = this.recentHistory.filter((row) => row.recorded_at >= recentSince);
