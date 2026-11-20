@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "lunch-line-worker",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": ["-c", "cd web && npx --yes wrangler@4.152.0 dev --local --port 8787"],
+      "port": 8787
+    }
+  ]
+}

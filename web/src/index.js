@@ -10,6 +10,11 @@ const MAXIMUM_FEEDBACK_CHARACTERS = 2000;
 const RECENT_HISTORY_MILLISECONDS = 92 * 60 * 1000;
 const MAXIMUM_HISTORY_HOURS = 168;
 const HISTORY_CACHE_SECONDS = 300;
+// the page's chart loads fixed tiles so every viewer shares the same cache entries.
+// key = bucket length in seconds (0 = every reading), value = tile length in seconds. page.html has the same table
+const CHART_TILE_SECONDS = { 0: 30 * 60, 60: 6 * 3600, 120: 12 * 3600, 900: 24 * 3600 };
+// a tile that ended before the request never changes again
+const PAST_CHART_TILE_CACHE_SECONDS = 86400;
 
 // one durable object fans camera updates out to every open browser over hibernatable websockets
 export class LunchLine extends DurableObject {
@@ -19,12 +24,16 @@ export class LunchLine extends DurableObject {
     this.latestUpdate = null;
     this.lastRecordedAt = 0;
     this.recentHistory = null;
+    this.firstRecordedAt = null;
+    this.rolledUpThrough = null;
     // the free plan's daily rows-read quota makes every sql call throw, even CREATE TABLE IF NOT EXISTS.
     // a throw here would kill the object and with it the live feed (11/20), so storage failures only stop recording
     try {
       const sql = this.ctx.storage.sql;
       sql.exec("CREATE TABLE IF NOT EXISTS history (recorded_at INTEGER PRIMARY KEY, count INTEGER NOT NULL, people TEXT NOT NULL)");
       sql.exec("CREATE TABLE IF NOT EXISTS feedback (submitted_at INTEGER NOT NULL, message TEXT NOT NULL)");
+      // one summary row per minute of readings, so the 6 h to 7 d charts read 1/30 of the rows (see rollUpMinutes)
+      sql.exec("CREATE TABLE IF NOT EXISTS history_minutes (minute_start INTEGER PRIMARY KEY, readings INTEGER NOT NULL, count_sum REAL NOT NULL, count_low REAL NOT NULL, count_high REAL NOT NULL)");
     } catch (error) {
       console.error(`lunch line storage unavailable at startup: ${error}`);
     }
@@ -52,6 +61,59 @@ export class LunchLine extends DurableObject {
     return this.ctx.storage.sql
       .exec("SELECT recorded_at, count, people FROM history WHERE recorded_at >= ? ORDER BY recorded_at", sinceMilliseconds)
       .toArray();
+  }
+
+  // folds the readings since the last call into history_minutes, redoing the minute that was in progress.
+  // each reading is read once, so this costs at most the ~43k rows/day that are written anyway.
+  // the very first call summarizes the whole history table in one statement
+  rollUpMinutes() {
+    const sql = this.ctx.storage.sql;
+    if (this.rolledUpThrough === null) {
+      this.rolledUpThrough = sql.exec("SELECT MAX(minute_start) AS latest FROM history_minutes").one().latest ?? 0;
+    }
+    const currentMinute = Math.floor(Date.now() / 60000) * 60000;
+    sql.exec(
+      "INSERT OR REPLACE INTO history_minutes (minute_start, readings, count_sum, count_low, count_high) " +
+        "SELECT (recorded_at / 60000) * 60000 AS minute_start, COUNT(*), SUM(count), MIN(count), MAX(count) FROM history WHERE recorded_at >= ? GROUP BY minute_start",
+      this.rolledUpThrough
+    );
+    this.rolledUpThrough = currentMinute;
+  }
+
+  // one chart tile covering [from, to). bucketSeconds 0: every reading as [time, count].
+  // otherwise one [bucket start, mean, lowest, highest] per bucket that has readings.
+  // `first` is the time of the oldest reading, so the page knows where paging back ends
+  chartTile(bucketSeconds, from, to) {
+    const sql = this.ctx.storage.sql;
+    if (this.firstRecordedAt === null) {
+      try {
+        this.firstRecordedAt = sql.exec("SELECT MIN(recorded_at) AS first FROM history").one().first;
+      } catch (error) {
+        // database blocked (daily read quota): recent tiles still come from memory below
+        console.error(`lunch line first reading lookup failed: ${error}`);
+      }
+    }
+    let points;
+    if (bucketSeconds === 0) {
+      const rows =
+        from >= Date.now() - RECENT_HISTORY_MILLISECONDS
+          ? this.history(from)
+          : sql.exec("SELECT recorded_at, count FROM history WHERE recorded_at >= ? AND recorded_at < ? ORDER BY recorded_at", from, to).toArray();
+      points = rows.filter((row) => row.recorded_at < to).map((row) => [row.recorded_at, row.count]);
+    } else {
+      if (to > (this.rolledUpThrough ?? 0)) this.rollUpMinutes();
+      const bucketMilliseconds = bucketSeconds * 1000; // from the CHART_TILE_SECONDS keys, never user text
+      points = sql
+        .exec(
+          `SELECT (minute_start / ${bucketMilliseconds}) * ${bucketMilliseconds} AS bucket_start, ROUND(SUM(count_sum) / SUM(readings), 2) AS mean, MIN(count_low) AS low, MAX(count_high) AS high ` +
+            "FROM history_minutes WHERE minute_start >= ? AND minute_start < ? GROUP BY bucket_start ORDER BY bucket_start",
+          from,
+          to
+        )
+        .toArray()
+        .map((row) => [row.bucket_start, row.mean, row.low, row.high]);
+    }
+    return { first: this.firstRecordedAt, points };
   }
 
   // anonymous: only the time and the text are kept
@@ -165,6 +227,40 @@ async function historyResponse(url, env) {
   });
 }
 
+// GET /lunch-line-monitor/history/chart?bucket=<seconds>&tile=<n>: tile n of the page's chart, covering
+// [n * tile length, (n + 1) * tile length) in unix time. bucket 0 = every reading, else averaged buckets (see chartTile)
+async function chartResponse(bucketSeconds, tile, env) {
+  const from = tile * CHART_TILE_SECONDS[bucketSeconds] * 1000;
+  const to = from + CHART_TILE_SECONDS[bucketSeconds] * 1000;
+  const { first, points } = await lunchLineFor(env).chartTile(bucketSeconds, from, to);
+  return Response.json({ bucket_seconds: bucketSeconds, from, to, first, points });
+}
+
+// serves a history response from the edge cache, or builds it and caches it for cacheSeconds
+async function cachedHistoryResponse(cacheUrl, cacheSeconds, ctx, buildResponse) {
+  const cacheRequest = new Request(cacheUrl, { method: "GET" });
+  const cached = await caches.default.match(cacheRequest);
+  if (cached) return cached;
+  try {
+    const response = await buildResponse();
+    if (response.ok) {
+      const cacheable = new Response(response.body, response);
+      cacheable.headers.set("cache-control", `public, max-age=${cacheSeconds}`);
+      ctx.waitUntil(caches.default.put(cacheRequest, cacheable.clone()));
+      return cacheable;
+    }
+    return response;
+  } catch (error) {
+    if (!/rows.?read|SQLITE_FULL|daily.*limit|free.*limit/i.test(String(error))) throw error;
+    const reset = new Date();
+    reset.setUTCHours(24, 0, 0, 0);
+    return new Response("count history temporarily unavailable: database daily read limit reached; live camera and count remain available", {
+      status: 503,
+      headers: { "cache-control": "no-store", "retry-after": String(Math.ceil((reset.getTime() - Date.now()) / 1000)) },
+    });
+  }
+}
+
 const API_HEADERS = { "cache-control": "no-store", "access-control-allow-origin": "*" };
 
 function isoTime(seconds) {
@@ -227,33 +323,26 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, "");
 
+    if (path === `${BASE_PATH}/history/chart`) {
+      const bucketSeconds = Number(url.searchParams.get("bucket"));
+      const tile = Number(url.searchParams.get("tile"));
+      const tileMilliseconds = CHART_TILE_SECONDS[bucketSeconds] * 1000;
+      if (!(bucketSeconds in CHART_TILE_SECONDS) || !Number.isInteger(tile) || tile < 0 || tile * tileMilliseconds > Date.now()) {
+        return new Response(`bucket must be one of ${Object.keys(CHART_TILE_SECONDS).join(", ")} and tile a whole number that has already started`, { status: 400 });
+      }
+      const cacheUrl = new URL(`https://nuevasocratica.com${BASE_PATH}/history/chart`);
+      cacheUrl.searchParams.set("bucket", String(bucketSeconds));
+      cacheUrl.searchParams.set("tile", String(tile));
+      const cacheSeconds = (tile + 1) * tileMilliseconds <= Date.now() ? PAST_CHART_TILE_CACHE_SECONDS : HISTORY_CACHE_SECONDS;
+      return cachedHistoryResponse(cacheUrl, cacheSeconds, ctx, () => chartResponse(bucketSeconds, tile, env));
+    }
     if (path === `${BASE_PATH}/history`) {
       const hours = Number(url.searchParams.get("hours") ?? 24);
       if (!Number.isFinite(hours) || hours <= 0 || hours > MAXIMUM_HISTORY_HOURS) return historyResponse(url, env);
       const cacheUrl = new URL(`https://nuevasocratica.com${BASE_PATH}/history`);
       cacheUrl.searchParams.set("hours", String(hours));
       if (url.searchParams.get("format") === "json") cacheUrl.searchParams.set("format", "json");
-      const cacheRequest = new Request(cacheUrl, { method: "GET" });
-      const cached = await caches.default.match(cacheRequest);
-      if (cached) return cached;
-      try {
-        const response = await historyResponse(url, env);
-        if (response.ok) {
-          const cacheable = new Response(response.body, response);
-          cacheable.headers.set("cache-control", `public, max-age=${HISTORY_CACHE_SECONDS}`);
-          ctx.waitUntil(caches.default.put(cacheRequest, cacheable.clone()));
-          return cacheable;
-        }
-        return response;
-      } catch (error) {
-        if (!/rows.?read|SQLITE_FULL|daily.*limit|free.*limit/i.test(String(error))) throw error;
-        const reset = new Date();
-        reset.setUTCHours(24, 0, 0, 0);
-        return new Response("count history temporarily unavailable: database daily read limit reached; live camera and count remain available", {
-          status: 503,
-          headers: { "cache-control": "no-store", "retry-after": String(Math.ceil((reset.getTime() - Date.now()) / 1000)) },
-        });
-      }
+      return cachedHistoryResponse(cacheUrl, HISTORY_CACHE_SECONDS, ctx, () => historyResponse(url, env));
     }
     if (path === `${BASE_PATH}/api/count` || path === `${BASE_PATH}/api/image.jpg`) return apiResponse(path, env);
 
