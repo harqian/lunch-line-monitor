@@ -88,7 +88,23 @@
 <!-- posthog analytics: page views + clicks, project "lunch line monitor" in the socratica org (1password "PostHog socratica lunch line monitor") -->
 <script>
   !function(t,e){var o,n,p,r;e.__SV||(window.posthog=e,e._i=[],e.init=function(i,s,a){function g(t,e){var o=e.split(".");2==o.length&&(t=t[o[0]],e=o[1]),t[e]=function(){t.push([e].concat(Array.prototype.slice.call(arguments,0)))}}(p=t.createElement("script")).type="text/javascript",p.crossOrigin="anonymous",p.async=!0,p.src=s.api_host.replace(".i.posthog.com","-assets.i.posthog.com")+"/static/array.js",(r=t.getElementsByTagName("script")[0]).parentNode.insertBefore(p,r);var u=e;for(void 0!==a?u=e[a]=[]:a="posthog",u.people=u.people||[],u.toString=function(t){var e="posthog";return"posthog"!==a&&(e+="."+a),t||(e+=" (stub)"),e},u.people.toString=function(){return u.toString(1)+".people (stub)"},o="init capture register register_once register_for_session unregister unregister_for_session getFeatureFlag getFeatureFlagPayload isFeatureEnabled reloadFeatureFlags updateEarlyAccessFeatureEnrollment getEarlyAccessFeatures on onFeatureFlags onSessionId getSurveys getActiveMatchingSurveys renderSurvey canRenderSurvey getNextSurveyStep identify setPersonProperties group resetGroups setPersonPropertiesForFlags resetPersonPropertiesForFlags setGroupPropertiesForFlags resetGroupPropertiesForFlags reset get_distinct_id getGroups get_session_id get_session_replay_url alias set_config startSessionRecording stopSessionRecording sessionRecordingStarted captureException loadToolbar get_property getSessionProperty createPersonProfile opt_in_capturing opt_out_capturing has_opted_in_capturing has_opted_out_capturing clear_opt_in_out_capturing debug".split(" "),n=0;n<o.length;n++)g(u,o[n]);e._i.push([i,s,a])},e.__SV=1)}(document,window.posthog||[]);
-  posthog.init("phc_AZ8ALyLTgAE3bAHafuZFY9PxMya98qC73s9w5XLi7pmB", { api_host: "https://us.i.posthog.com", person_profiles: "identified_only" });
+  posthog.init("phc_AZ8ALyLTgAE3bAHafuZFY9PxMya98qC73s9w5XLi7pmB", { api_host: "https://hedgehog-five.vercel.app", ui_host: "https://us.posthog.com", person_profiles: "identified_only", rewriteRequestPath: function (url) {
+    var pathRewrites = [["/i/v0/e/", "/a1/"], ["/e/", "/a2/"], ["/s/", "/a3/"], ["/flags/", "/a4/"], ["/array/", "/a5/"], ["/static/", "/a6/"]];
+    var basenameCodes = { "posthog-recorder.js": "b1.js", "recorder.js": "b1.js", "recorder-v2.js": "b1.js", "lazy-recorder.js": "b1.js", "surveys.js": "b2.js", "exception-autocapture.js": "b3.js", "toolbar.js": "b4.js", "dead-clicks-autocapture.js": "b5.js", "web-vitals.js": "b6.js", "tracing-headers.js": "b7.js" };
+    for (var i = 0; i < pathRewrites.length; i++) {
+      var posthogPath = pathRewrites[i][0], proxyPath = pathRewrites[i][1];
+      if (url.pathname.indexOf(posthogPath) === 0) {
+        var rest = url.pathname.slice(posthogPath.length);
+        if (posthogPath === "/static/") {
+          var slash = rest.lastIndexOf("/"), dir = slash === -1 ? "" : rest.slice(0, slash + 1), basename = slash === -1 ? rest : rest.slice(slash + 1);
+          rest = dir + (basenameCodes[basename] || basename);
+        }
+        url.pathname = proxyPath + rest;
+        break;
+      }
+    }
+    return url.pathname + url.search;
+  } });
 </script>
 </head>
 <body>
