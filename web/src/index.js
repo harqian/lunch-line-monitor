@@ -6,6 +6,12 @@ const ROLE_HEADER = "x-lunch-line-role";
 // one history row per 2 s keeps writes (~43k/day) under the free plan's 100k sqlite rows written per day
 const RECORD_INTERVAL_MILLISECONDS = 2000;
 const MAXIMUM_FEEDBACK_CHARACTERS = 2000;
+const HISTORY_BATCH_SIZE = 1000;
+const PACIFIC_TIME_FORMATTER = new Intl.DateTimeFormat("sv-SE", {
+  timeZone: "America/Los_Angeles",
+  year: "numeric", month: "2-digit", day: "2-digit",
+  hour: "2-digit", minute: "2-digit", second: "2-digit",
+});
 
 // one durable object fans camera updates out to every open browser over hibernatable websockets
 export class LunchLine extends DurableObject {
@@ -19,12 +25,6 @@ export class LunchLine extends DurableObject {
     sql.exec("CREATE TABLE IF NOT EXISTS feedback (submitted_at INTEGER NOT NULL, message TEXT NOT NULL)");
   }
 
-  history(sinceMilliseconds) {
-    return this.ctx.storage.sql
-      .exec("SELECT recorded_at, count, people FROM history WHERE recorded_at >= ? ORDER BY recorded_at", sinceMilliseconds)
-      .toArray();
-  }
-
   // anonymous: only the time and the text are kept
   addFeedback(message) {
     this.ctx.storage.sql.exec("INSERT INTO feedback (submitted_at, message) VALUES (?, ?)", Date.now(), message);
@@ -35,6 +35,10 @@ export class LunchLine extends DurableObject {
   }
 
   async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname.replace(/\/+$/, "") === `${BASE_PATH}/history`) {
+      return historyResponse(url, this.ctx.storage.sql);
+    }
     const role = request.headers.get(ROLE_HEADER);
     const [client, server] = Object.values(new WebSocketPair());
     this.ctx.acceptWebSocket(server, [role]);
@@ -79,7 +83,7 @@ async function bearerTokenMatches(authorizationHeader, expectedToken) {
 }
 
 function pacificTime(milliseconds) {
-  return new Date(milliseconds).toLocaleString("sv-SE", { timeZone: "America/Los_Angeles" });
+  return PACIFIC_TIME_FORMATTER.format(milliseconds);
 }
 
 // posts one feedback submission to #feedback in the socratica discord through a channel webhook.
@@ -103,23 +107,51 @@ function lunchLineFor(env) {
 }
 
 // GET /lunch-line-monitor/history?hours=24[&format=json]: one row per ~2 s of camera updates
-async function historyResponse(url, env) {
+function historyResponse(url, sql) {
   const hours = Number(url.searchParams.get("hours") ?? 24);
-  if (!(hours > 0)) return new Response("hours must be a positive number", { status: 400 });
-  const rows = await lunchLineFor(env).history(Date.now() - hours * 3600 * 1000);
-  if (url.searchParams.get("format") === "json") {
-    const body = rows.map((row) => ({
-      recorded_at: row.recorded_at,
-      pacific_time: pacificTime(row.recorded_at),
-      count: row.count,
-      people: JSON.parse(row.people),
-    }));
-    return Response.json(body, { headers: { "cache-control": "no-store" } });
-  }
-  const lines = ["pacific_time,unix_milliseconds,count"];
-  for (const row of rows) lines.push(`${pacificTime(row.recorded_at)},${row.recorded_at},${row.count}`);
-  return new Response(lines.join("\n") + "\n", {
-    headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": 'inline; filename="lunch-line-history.csv"', "cache-control": "no-store" },
+  if (!(hours > 0) || !Number.isFinite(hours)) return new Response("hours must be a positive number", { status: 400 });
+  const until = Date.now();
+  let since = until - hours * 3600 * 1000;
+  const json = url.searchParams.get("format") === "json";
+  const encoder = new TextEncoder();
+  let first = true;
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(json ? "[" : "pacific_time,unix_milliseconds,count\n"));
+    },
+    pull(controller) {
+      const rows = sql.exec(
+        `SELECT recorded_at, count${json ? ", people" : ""} FROM history WHERE recorded_at >= ? AND recorded_at <= ? ORDER BY recorded_at LIMIT ?`,
+        since, until, HISTORY_BATCH_SIZE
+      ).toArray();
+      let chunk = "";
+      for (const row of rows) {
+        if (json) {
+          chunk += (first ? "" : ",") + JSON.stringify({
+            recorded_at: row.recorded_at,
+            pacific_time: pacificTime(row.recorded_at),
+            count: row.count,
+            people: JSON.parse(row.people),
+          });
+          first = false;
+        } else {
+          chunk += `${pacificTime(row.recorded_at)},${row.recorded_at},${row.count}\n`;
+        }
+      }
+      if (rows.length < HISTORY_BATCH_SIZE) {
+        if (json) chunk += "]";
+        controller.enqueue(encoder.encode(chunk));
+        controller.close();
+      } else {
+        since = rows.at(-1).recorded_at + 1;
+        controller.enqueue(encoder.encode(chunk));
+      }
+    },
+  });
+  return new Response(body, {
+    headers: json
+      ? { "content-type": "application/json", "cache-control": "no-store" }
+      : { "content-type": "text/csv; charset=utf-8", "content-disposition": 'inline; filename="lunch-line-history.csv"', "cache-control": "no-store" },
   });
 }
 
@@ -185,7 +217,7 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, "");
 
-    if (path === `${BASE_PATH}/history`) return historyResponse(url, env);
+    if (path === `${BASE_PATH}/history`) return lunchLineFor(env).fetch(request);
     if (path === `${BASE_PATH}/api/count` || path === `${BASE_PATH}/api/image.jpg`) return apiResponse(path, env);
 
     // POST {"message": "..."} from the page's feedback box. GET lists it all, newest first, with the bearer token
