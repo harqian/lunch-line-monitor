@@ -6,6 +6,10 @@ const ROLE_HEADER = "x-lunch-line-role";
 // one history row per 2 s keeps writes (~43k/day) under the free plan's 100k sqlite rows written per day
 const RECORD_INTERVAL_MILLISECONDS = 2000;
 const MAXIMUM_FEEDBACK_CHARACTERS = 2000;
+// retain two extra minutes so the worker-to-object call cannot push a 90-minute request outside the cache
+const RECENT_HISTORY_MILLISECONDS = 92 * 60 * 1000;
+const MAXIMUM_HISTORY_HOURS = 168;
+const HISTORY_CACHE_SECONDS = 300;
 
 // one durable object fans camera updates out to every open browser over hibernatable websockets
 export class LunchLine extends DurableObject {
@@ -14,12 +18,25 @@ export class LunchLine extends DurableObject {
     // memory only: lost if the object hibernates, which only happens after the camera stops sending
     this.latestUpdate = null;
     this.lastRecordedAt = 0;
+    this.recentHistory = null;
     const sql = this.ctx.storage.sql;
     sql.exec("CREATE TABLE IF NOT EXISTS history (recorded_at INTEGER PRIMARY KEY, count INTEGER NOT NULL, people TEXT NOT NULL)");
     sql.exec("CREATE TABLE IF NOT EXISTS feedback (submitted_at INTEGER NOT NULL, message TEXT NOT NULL)");
   }
 
   history(sinceMilliseconds) {
+    const recentSince = Date.now() - RECENT_HISTORY_MILLISECONDS;
+    if (sinceMilliseconds >= recentSince) {
+      if (this.recentHistory === null) {
+        this.recentHistory = this.queryHistory(recentSince);
+      }
+      this.recentHistory = this.recentHistory.filter((row) => row.recorded_at >= recentSince);
+      return this.recentHistory.filter((row) => row.recorded_at >= sinceMilliseconds);
+    }
+    return this.queryHistory(sinceMilliseconds);
+  }
+
+  queryHistory(sinceMilliseconds) {
     return this.ctx.storage.sql
       .exec("SELECT recorded_at, count, people FROM history WHERE recorded_at >= ? ORDER BY recorded_at", sinceMilliseconds)
       .toArray();
@@ -63,6 +80,11 @@ export class LunchLine extends DurableObject {
       update.count,
       JSON.stringify(update.people)
     );
+    if (this.recentHistory !== null) {
+      const recentSince = update.received_at - RECENT_HISTORY_MILLISECONDS;
+      this.recentHistory = this.recentHistory.filter((row) => row.recorded_at >= recentSince);
+      this.recentHistory.push({ recorded_at: update.received_at, count: update.count, people: JSON.stringify(update.people) });
+    }
   }
 
   webSocketClose(socket, code, reason) {
@@ -105,7 +127,9 @@ function lunchLineFor(env) {
 // GET /lunch-line-monitor/history?hours=24[&format=json]: one row per ~2 s of camera updates
 async function historyResponse(url, env) {
   const hours = Number(url.searchParams.get("hours") ?? 24);
-  if (!(hours > 0)) return new Response("hours must be a positive number", { status: 400 });
+  if (!Number.isFinite(hours) || hours <= 0 || hours > MAXIMUM_HISTORY_HOURS) {
+    return new Response(`hours must be a finite number greater than 0 and at most ${MAXIMUM_HISTORY_HOURS}`, { status: 400 });
+  }
   const rows = await lunchLineFor(env).history(Date.now() - hours * 3600 * 1000);
   if (url.searchParams.get("format") === "json") {
     const body = rows.map((row) => ({
@@ -185,7 +209,34 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, "");
 
-    if (path === `${BASE_PATH}/history`) return historyResponse(url, env);
+    if (path === `${BASE_PATH}/history`) {
+      const hours = Number(url.searchParams.get("hours") ?? 24);
+      if (!Number.isFinite(hours) || hours <= 0 || hours > MAXIMUM_HISTORY_HOURS) return historyResponse(url, env);
+      const cacheUrl = new URL(`https://nuevasocratica.com${BASE_PATH}/history`);
+      cacheUrl.searchParams.set("hours", String(hours));
+      if (url.searchParams.get("format") === "json") cacheUrl.searchParams.set("format", "json");
+      const cacheRequest = new Request(cacheUrl, { method: "GET" });
+      const cached = await caches.default.match(cacheRequest);
+      if (cached) return cached;
+      try {
+        const response = await historyResponse(url, env);
+        if (response.ok) {
+          const cacheable = new Response(response.body, response);
+          cacheable.headers.set("cache-control", `public, max-age=${HISTORY_CACHE_SECONDS}`);
+          ctx.waitUntil(caches.default.put(cacheRequest, cacheable.clone()));
+          return cacheable;
+        }
+        return response;
+      } catch (error) {
+        if (!/rows.?read|SQLITE_FULL|daily.*limit|free.*limit/i.test(String(error))) throw error;
+        const reset = new Date();
+        reset.setUTCHours(24, 0, 0, 0);
+        return new Response("count history temporarily unavailable: database daily read limit reached; live camera and count remain available", {
+          status: 503,
+          headers: { "cache-control": "no-store", "retry-after": String(Math.ceil((reset.getTime() - Date.now()) / 1000)) },
+        });
+      }
+    }
     if (path === `${BASE_PATH}/api/count` || path === `${BASE_PATH}/api/image.jpg`) return apiResponse(path, env);
 
     // POST {"message": "..."} from the page's feedback box. GET lists it all, newest first, with the bearer token
