@@ -34,7 +34,13 @@ export class LunchLine extends DurableObject {
     const recentSince = Date.now() - RECENT_HISTORY_MILLISECONDS;
     if (sinceMilliseconds >= recentSince) {
       if (this.recentHistory === null) {
-        this.recentHistory = this.queryHistory(recentSince);
+        try {
+          this.recentHistory = this.queryHistory(recentSince);
+        } catch (error) {
+          // database blocked (daily read quota): the chart runs from memory, filled by live updates since the object started
+          console.error(`lunch line history read failed, serving memory only: ${error}`);
+          this.recentHistory = [];
+        }
       }
       this.recentHistory = this.recentHistory.filter((row) => row.recorded_at >= recentSince);
       return this.recentHistory.filter((row) => row.recorded_at >= sinceMilliseconds);
@@ -89,7 +95,8 @@ export class LunchLine extends DurableObject {
       );
     } catch (error) {
       console.error(`lunch line history row not recorded: ${error}`);
-      return;
+      // keep the 90 minute chart working from memory while the database is blocked
+      if (this.recentHistory === null) this.recentHistory = [];
     }
     if (this.recentHistory !== null) {
       const recentSince = update.received_at - RECENT_HISTORY_MILLISECONDS;
