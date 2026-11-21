@@ -303,7 +303,8 @@
     const key = `${bucketSeconds}:${index}`;
     let tile = trendTiles.get(key);
     if (!tile) trendTiles.set(key, (tile = { state: "new", points: [] }));
-    const wanted = tile.state === "new" || tile.state === "stale" || ((tile.state === "failed" || tile.partial) && Date.now() >= tile.retryAt);
+    const endedIncomplete = tile.state === "loaded" && !tile.complete && Date.now() >= Math.max(tile.to, tile.retryAt);
+    const wanted = tile.state === "new" || tile.state === "stale" || endedIncomplete || ((tile.state === "failed" || tile.partial) && Date.now() >= tile.retryAt);
     if (!wanted) return tile.promise;
     tile.state = "loading";
     tile.retryAt = Date.now() + 15000;
@@ -320,7 +321,8 @@
         tile.points = bucketSeconds === 0
           ? body.points.map(([at, count]) => ({ at, count }))
           : body.points.map(([from, count, low, high, readings, sum, recordedThrough]) => ({ from, to: from + bucketSeconds * 1000, count, low, high, readings, sum, recordedThrough }));
-        tile.complete = body.to <= Date.now() && !body.partial;
+        tile.complete = body.complete;
+        tile.to = body.to;
         tile.partial = body.partial;
         tile.retryAt = Date.now() + 15000;
         tile.state = "loaded";

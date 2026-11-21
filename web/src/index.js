@@ -94,7 +94,10 @@ export class LunchLine extends DurableObject {
     if (sinceMilliseconds >= recentSince) {
       if (this.recentHistory === null || (this.recentHistoryUnavailable && Date.now() >= this.recentHistoryRetryAt)) {
         try {
-          this.recentHistory = this.queryHistory(recentSince);
+          const saved = this.queryHistory(recentSince);
+          // recovery must retain readings that only reached memory while recording was blocked
+          const byTime = new Map((this.recentHistory ?? []).concat(saved).map((row) => [row.recorded_at, row]));
+          this.recentHistory = [...byTime.values()].sort((left, right) => left.recorded_at - right.recorded_at);
           this.recentHistoryUnavailable = false;
         } catch (error) {
           // database blocked (daily read quota): the chart runs from memory, filled by live updates since the object started
@@ -116,6 +119,12 @@ export class LunchLine extends DurableObject {
     return this.historySql(limit * 2 + 32,
       "SELECT recorded_at, count, people FROM history WHERE recorded_at >= ? ORDER BY recorded_at LIMIT ?",
       sinceMilliseconds, limit);
+  }
+
+  exportHistory(sinceMilliseconds) {
+    const rows = this.history(sinceMilliseconds);
+    const partial = sinceMilliseconds >= Date.now() - RECENT_HISTORY_MILLISECONDS && this.recentHistoryUnavailable;
+    return { rows, partial };
   }
 
   ensureMinuteHistory() {
@@ -209,10 +218,12 @@ export class LunchLine extends DurableObject {
         )
         .map((row) => [row.bucket_start, row.mean, row.low, row.high, row.readings, row.count_sum, row.recorded_through]);
     }
-    const body = { first: this.firstRecordedAt, points, partial };
+    const complete = to <= Date.now() && !partial;
+    const body = { first: this.firstRecordedAt, points, partial, complete };
     if (!partial) {
       if (this.chartTiles.size >= 64) this.chartTiles.delete(this.chartTiles.keys().next().value);
-      this.chartTiles.set(key, { body, expires: Date.now() + (to <= Date.now() ? PAST_CHART_TILE_CACHE_SECONDS : HISTORY_CACHE_SECONDS) * 1000 });
+      const expires = complete ? Date.now() + PAST_CHART_TILE_CACHE_SECONDS * 1000 : Math.min(to, Date.now() + HISTORY_CACHE_SECONDS * 1000);
+      this.chartTiles.set(key, { body, expires });
     }
     return body;
   }
@@ -312,7 +323,8 @@ async function historyResponse(url, env) {
   if (!Number.isFinite(hours) || hours <= 0 || hours > MAXIMUM_HISTORY_HOURS) {
     return new Response(`hours must be a finite number greater than 0 and at most ${MAXIMUM_HISTORY_HOURS}`, { status: 400 });
   }
-  const rows = await lunchLineFor(env).history(Date.now() - hours * 3600 * 1000);
+  const { rows, partial } = await lunchLineFor(env).exportHistory(Date.now() - hours * 3600 * 1000);
+  if (partial) throw new Error("history read budget or storage unavailable");
   if (url.searchParams.get("format") === "json") {
     const body = rows.map((row) => ({
       recorded_at: row.recorded_at,
@@ -334,8 +346,11 @@ async function historyResponse(url, env) {
 async function chartResponse(bucketSeconds, tile, env) {
   const from = tile * CHART_TILE_SECONDS[bucketSeconds] * 1000;
   const to = from + CHART_TILE_SECONDS[bucketSeconds] * 1000;
-  const { first, points, partial } = await lunchLineFor(env).chartTile(bucketSeconds, from, to);
-  return Response.json({ bucket_seconds: bucketSeconds, from, to, first, points, partial }, { headers: partial ? { "cache-control": "no-store" } : {} });
+  const { first, points, partial, complete } = await lunchLineFor(env).chartTile(bucketSeconds, from, to);
+  const seconds = complete ? PAST_CHART_TILE_CACHE_SECONDS : Math.min(HISTORY_CACHE_SECONDS, Math.floor((to - Date.now()) / 1000));
+  return Response.json({ bucket_seconds: bucketSeconds, from, to, first, points, partial, complete }, {
+    headers: { "cache-control": partial || seconds <= 0 ? "no-store" : `public, max-age=${seconds}` },
+  });
 }
 
 // serves a history response from the edge cache, or builds it and caches it for cacheSeconds
@@ -347,18 +362,17 @@ async function cachedHistoryResponse(cacheUrl, cacheSeconds, ctx, buildResponse)
     const response = await buildResponse();
     if (response.ok && response.headers.get("cache-control") !== "no-store") {
       const cacheable = new Response(response.body, response);
-      cacheable.headers.set("cache-control", `public, max-age=${cacheSeconds}`);
+      cacheable.headers.set("cache-control", response.headers.get("cache-control") ?? `public, max-age=${cacheSeconds}`);
       ctx.waitUntil(caches.default.put(cacheRequest, cacheable.clone()));
       return cacheable;
     }
     return response;
   } catch (error) {
     if (!historyLimitReached(error)) throw error;
-    const reset = new Date();
-    reset.setUTCHours(24, 0, 0, 0);
+    const reset = (Math.floor(Date.now() / 86400000) + 1) * 86400000;
     return new Response("count history temporarily paused to protect the daily read allowance; live camera and count remain available", {
       status: 503,
-      headers: { "cache-control": "no-store", "retry-after": String(Math.ceil((reset.getTime() - Date.now()) / 1000)) },
+      headers: { "cache-control": "no-store", "retry-after": String(Math.ceil((reset - Date.now()) / 1000)) },
     });
   }
 }
