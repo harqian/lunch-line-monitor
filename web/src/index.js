@@ -61,10 +61,12 @@ export class LunchLine extends DurableObject {
     this.historyReadRetryAfter = 0;
     this.historyRowsRead = 0;
     this.exportChunksReady = false;
+    this.historyBudgetReconciliation = null;
     this.chartTiles = new Map();
     // the free plan's daily rows-read quota makes every sql call throw, even CREATE TABLE IF NOT EXISTS.
     // a throw here would kill the object and with it the live feed (11/20), so storage failures only stop recording
     try {
+      this.#reconcileHistoryBudget(env);
       const sql = this.ctx.storage.sql;
       sql.exec("CREATE TABLE IF NOT EXISTS history (recorded_at INTEGER PRIMARY KEY, count INTEGER NOT NULL, people TEXT NOT NULL)");
       sql.exec("CREATE TABLE IF NOT EXISTS feedback (submitted_at INTEGER NOT NULL, message TEXT NOT NULL)");
@@ -73,6 +75,29 @@ export class LunchLine extends DurableObject {
     } catch (error) {
       console.error(`lunch line storage unavailable at startup: ${error}`);
     }
+  }
+
+  #reconcileHistoryBudget(env) {
+    if (!env.HISTORY_READ_BUDGET_RECONCILIATION) return;
+    // operator-supplied account-wide read upper bound, including a documented analytics-lag allowance.
+    // this is a dated, one-time repair for unused reservations forfeited by the former large exports
+    const baseline = JSON.parse(env.HISTORY_READ_BUDGET_RECONCILIATION);
+    const day = Math.floor(Date.now() / 86400000);
+    if (!Number.isSafeInteger(baseline.observedAt) || baseline.observedAt <= 0) throw new Error("invalid history read reconciliation timestamp");
+    if (baseline.day !== day || Date.now() < baseline.observedAt || Date.now() - baseline.observedAt > 1800000) return;
+    if (!Number.isSafeInteger(baseline.accountReadsUpperBound) || baseline.accountReadsUpperBound <= 0 || baseline.accountReadsUpperBound >= HISTORY_DAILY_READ_BUDGET) {
+      throw new Error("invalid history read reconciliation upper bound");
+    }
+    const key = "history-read-budget-reconciliation-v1";
+    this.historyBudgetReconciliation = this.ctx.storage.kv.get(key);
+    if (this.historyBudgetReconciliation?.day === day) return;
+    const saved = this.ctx.storage.kv.get("history-read-budget");
+    if (saved?.day !== day || saved.reserved <= baseline.accountReadsUpperBound) return;
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.kv.put("history-read-budget", { day, reserved: baseline.accountReadsUpperBound });
+      this.historyBudgetReconciliation = { ...baseline, previousReserved: saved.reserved };
+      this.ctx.storage.kv.put(key, this.historyBudgetReconciliation);
+    });
   }
 
   reserveHistoryReads(maximumRowsRead) {
@@ -106,7 +131,7 @@ export class LunchLine extends DurableObject {
       if (cursor.rowsRead > maximumRowsRead) {
         // an unexpected query plan must stop further reads, never silently outrun its reservation
         this.historyReadRetryAfter = (day + 1) * 86400000;
-        throw new Error("history read budget estimate exceeded");
+        throw new Error(`history read budget estimate exceeded: ${cursor.rowsRead} reads, maximum ${maximumRowsRead}`);
       }
       return rows;
     } catch (error) {
@@ -149,7 +174,7 @@ export class LunchLine extends DurableObject {
 
   exportHistory(sinceMilliseconds) {
     const before = this.historyRowsRead;
-    const diagnostics = { chunksBuilt: 0, chunksReused: 0, rowsRead: 0 };
+    const diagnostics = { chunksBuilt: 0, chunksReused: 0, rowsRead: 0, previousReserved: this.historyBudgetReconciliation?.previousReserved };
     if (sinceMilliseconds >= Date.now() - RECENT_HISTORY_MILLISECONDS) {
       const rows = this.history(sinceMilliseconds);
       diagnostics.rowsRead = this.historyRowsRead - before;
@@ -421,6 +446,7 @@ async function historyResponse(url, env) {
     headers["x-history-rows-read"] = String(diagnostics.rowsRead);
     headers["x-history-chunks-built"] = String(diagnostics.chunksBuilt);
     headers["x-history-chunks-reused"] = String(diagnostics.chunksReused);
+    if (diagnostics.previousReserved !== undefined) headers["x-history-reconciled-from"] = String(diagnostics.previousReserved);
   }
   if (url.searchParams.get("format") === "json") {
     const body = rows.map((row) => ({
@@ -466,10 +492,11 @@ async function cachedHistoryResponse(cacheUrl, cacheSeconds, ctx, buildResponse)
     return response;
   } catch (error) {
     if (!historyLimitReached(error)) throw error;
+    console.error(`history request paused: ${error}`);
     const reset = (Math.floor(Date.now() / 86400000) + 1) * 86400000;
     return new Response("count history temporarily paused to protect the daily read allowance; live camera and count remain available", {
       status: 503,
-      headers: { "cache-control": "no-store", "retry-after": String(Math.ceil((reset - Date.now()) / 1000)) },
+      headers: { "cache-control": "no-store", "retry-after": String(Math.ceil((reset - Date.now()) / 1000)), "x-history-pause-reason": String(error).includes("estimate exceeded") ? "query-read-estimate" : "daily-read-budget" },
     });
   }
 }
