@@ -76,14 +76,34 @@
   .feedback button { background: var(--ink); color: var(--field); border: 0; border-radius: 6px; padding: 6px 14px; font: 600 13px var(--mono); cursor: pointer; }
   .feedback button:disabled { opacity: 0.5; cursor: default; }
   .feedback-status { font-family: var(--mono); font-size: 13px; color: var(--ink-soft); }
+  [hidden] { display: none !important; }
   .trend { display: flex; flex-direction: column; gap: var(--unit); }
+  .trend-controls { display: flex; align-items: center; justify-content: space-between; gap: var(--unit); flex-wrap: wrap; }
+  .trend-ranges, .trend-seek { display: inline-flex; border: 1px solid var(--frame-line); border-radius: 6px; overflow: hidden; }
+  .trend-controls button { display: inline-flex; align-items: center; justify-content: center; min-width: 40px; height: 32px; padding: 0 10px; background: none; border: 0; color: var(--ink-soft); font: 13px var(--mono); cursor: pointer; }
+  .trend-controls button + button { border-left: 1px solid var(--frame-line); }
+  .trend-controls button:hover:not(:disabled) { background: var(--frame-floor); color: var(--ink); }
+  .trend-controls button:focus-visible { outline: 2px solid var(--ink); outline-offset: -2px; }
+  .trend-controls button:disabled { opacity: 0.35; cursor: default; }
+  .trend-controls button[aria-pressed="true"], .trend-controls button[aria-pressed="true"]:hover { background: var(--ink); color: var(--field); font-weight: 600; }
+  .trend-seek svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
   .trend-title { font-family: var(--mono); font-size: 13px; color: var(--ink-soft); }
-  .trend svg { width: 100%; height: auto; display: block; overflow: visible; }
+  .trend-chart { position: relative; touch-action: pan-y; cursor: crosshair; }
+  .trend-chart svg { width: 100%; height: auto; display: block; overflow: visible; }
+  .trend #trend-plot { transition: opacity 200ms; }
+  .trend.loading #trend-plot { opacity: 0.4; transition-delay: 150ms; }  /* only dims when the data takes a moment */
   .trend .grid { stroke: var(--frame-line); stroke-width: 1; }
   .trend .tick { fill: var(--ink-faint); font: 11px var(--mono); }
   .trend .raw { fill: rgba(255, 255, 255, 0.28); }
+  .trend .band { fill: rgba(255, 255, 255, 0.2); stroke: rgba(255, 255, 255, 0.2); stroke-width: 1; stroke-linejoin: round; }
   .trend .smoothed { fill: none; stroke: var(--ink); stroke-width: 2.5; stroke-linejoin: round; stroke-linecap: round; }
   .trend .empty { fill: var(--ink-faint); font: 13px var(--mono); }
+  .trend .cursor-line { stroke: var(--ink); stroke-width: 1; opacity: 0.75; }
+  .trend .cursor-average { fill: var(--ink); stroke: rgba(0, 20, 90, 0.55); stroke-width: 2; }
+  .trend .cursor-reading { fill: none; stroke: var(--ink); stroke-width: 1.5; }
+  .trend-tip { position: absolute; top: 0; left: 0; z-index: 1; pointer-events: none; white-space: nowrap; background: var(--ink); color: #0b1b4f; border-radius: 6px; padding: 6px 9px; font: 12px/1.5 var(--mono); box-shadow: 0 4px 14px rgba(0, 0, 30, 0.3); }
+  .trend-tip .tip-time { opacity: 0.65; }
+  .trend-tip b { font-weight: 700; font-variant-numeric: tabular-nums; }
 </style>
 <!-- posthog analytics: page views + clicks, project "lunch line monitor" in the socratica org (1password "PostHog socratica lunch line monitor") -->
 <script>
@@ -116,9 +136,20 @@
   </div>
   <div class="status"><span class="pulse"></span><span id="status-text">connecting…</span></div>
   <p class="disclaimer">this is a computer vision estimate, not a headcount. a crowd-counting model estimates how many people are in view, including people who are partly hidden. read it as a gauge of line length: higher means longer.</p>
-  <div class="trend">
-    <div class="trend-title">last 90 min · dots = each reading, line = 2 min average</div>
-    <svg id="trend" viewBox="0 0 720 200" role="img" aria-label="people detected over the last 90 minutes"></svg>
+  <div class="trend" id="trend-section">
+    <div class="trend-controls">
+      <div class="trend-ranges" id="trend-ranges" role="group" aria-label="chart time range"></div>
+      <div class="trend-seek" role="group" aria-label="move the chart through time">
+        <button type="button" id="trend-older" aria-label="earlier" title="earlier"><svg viewBox="0 0 14 14" aria-hidden="true"><path d="M9 2.5 4.5 7 9 11.5"/></svg></button>
+        <button type="button" id="trend-newer" aria-label="later" title="later"><svg viewBox="0 0 14 14" aria-hidden="true"><path d="M5 2.5 9.5 7 5 11.5"/></svg></button>
+        <button type="button" id="trend-latest" title="back to live">now</button>
+      </div>
+    </div>
+    <div class="trend-title" id="trend-title"></div>
+    <div class="trend-chart" id="trend-chart">
+      <svg id="trend" viewBox="0 0 720 200" role="img"></svg>
+      <div class="trend-tip" id="trend-tip" hidden></div>
+    </div>
   </div>
   <div class="frame" id="frame"><img id="frame-image" alt=""><div class="frame-empty" id="frame-empty">waiting for the camera</div></div>
   <form class="feedback" id="feedback-form">
@@ -189,7 +220,7 @@
 
   function connect() {
     const socket = new WebSocket(`${location.origin.replace(/^http/, "ws")}/lunch-line-monitor/live`);
-    socket.onopen = () => { socketOpen = true; reconnectDelay = 1000; renderStatus(); };
+    socket.onopen = () => { socketOpen = true; reconnectDelay = 1000; renderStatus(); refillTrendAfterReconnect(); };
     socket.onmessage = (event) => renderUpdate(JSON.parse(event.data));
     socket.onclose = () => {
       socketOpen = false;
@@ -199,32 +230,131 @@
     };
   }
 
-  // trend: count over [now - 90 min, now], raw readings plus a trailing time-window average
-  const TREND_WINDOW_MILLISECONDS = 90 * 60 * 1000;
-  const SMOOTHING_WINDOW_MILLISECONDS = 2 * 60 * 1000;
+  // trend chart: count over a time window. the range buttons pick the window length, the arrows page it
+  // back and forth, and hovering reads off one point. short ranges plot every reading (dots) plus a trailing
+  // 2 min average (line); long ranges plot the worker's averaged buckets (line) over a lowest-to-highest band
+  const MINUTE = 60 * 1000, HOUR = 60 * MINUTE, DAY = 24 * HOUR;
+  const SMOOTHING_WINDOW_MILLISECONDS = 2 * MINUTE;
   const TREND_SAMPLE_MILLISECONDS = 2000; // matches the worker's history row interval
   const TREND_GAP_MILLISECONDS = 30000; // readings further apart than this = camera was off, so the line breaks
-  const trendSvg = document.getElementById("trend");
-  let trendReadings = []; // [{time, count}], oldest first
+  const TREND_SLIDE_MILLISECONDS = 450;
+  // bucketSeconds 0 = every reading; otherwise the worker averages readings into buckets that long
+  const TREND_RANGES = [
+    { label: "30m", name: "30 min", span: 30 * MINUTE, bucketSeconds: 0 },
+    { label: "90m", name: "90 min", span: 90 * MINUTE, bucketSeconds: 0 },
+    { label: "6h", name: "6 hours", span: 6 * HOUR, bucketSeconds: 60 },
+    { label: "24h", name: "24 hours", span: DAY, bucketSeconds: 120 },
+    { label: "7d", name: "7 days", span: 7 * DAY, bucketSeconds: 900 },
+  ];
+  // history comes in fixed tiles (bucket seconds -> tile seconds) so every viewer hits the same cache entries. index.js has the same table
+  const TREND_TILE_SECONDS = { 0: 30 * 60, 60: 6 * 3600, 120: 12 * 3600, 900: 24 * 3600 };
+  const TREND_TICK_STEPS = [5 * MINUTE, 15 * MINUTE, 30 * MINUTE, HOUR, 3 * HOUR, 6 * HOUR, 12 * HOUR, DAY];
+  const CHART = { width: 720, height: 200, left: 28, right: 8, top: 8, bottom: 22 };
+  CHART.plotWidth = CHART.width - CHART.left - CHART.right;
+  CHART.plotHeight = CHART.height - CHART.top - CHART.bottom;
 
-  async function loadTrendHistory() {
-    const response = await fetch(`/lunch-line-monitor/history?hours=${TREND_WINDOW_MILLISECONDS / 3600000}`, { cache: "no-store" });
-    if (!response.ok) throw new Error(`history request failed: ${response.status}`);
-    const lines = (await response.text()).trim().split("\n").slice(1);
-    const loaded = lines.filter(Boolean).map((line) => {
-      const [, unixMilliseconds, count] = line.split(",");
-      return { time: Number(unixMilliseconds), count: Number(count) };
-    });
-    // keep live readings that arrived while the history request was in flight
-    const lastLoadedTime = loaded.length ? loaded[loaded.length - 1].time : 0;
-    trendReadings = loaded.concat(trendReadings.filter((reading) => reading.time > lastLoadedTime));
-    renderTrend();
+  const trendElements = {
+    section: document.getElementById("trend-section"),
+    ranges: document.getElementById("trend-ranges"),
+    older: document.getElementById("trend-older"),
+    newer: document.getElementById("trend-newer"),
+    latest: document.getElementById("trend-latest"),
+    title: document.getElementById("trend-title"),
+    chart: document.getElementById("trend-chart"),
+    svg: document.getElementById("trend"),
+    tip: document.getElementById("trend-tip"),
+  };
+  trendElements.svg.innerHTML =
+    `<defs><clipPath id="trend-clip"><rect x="${CHART.left}" y="0" width="${CHART.plotWidth}" height="${CHART.height - CHART.bottom + 3}"/></clipPath></defs>` +
+    `<g id="trend-axes"></g><g id="trend-plot" clip-path="url(#trend-clip)"></g><g id="trend-hover"></g>`;
+  trendElements.axes = document.getElementById("trend-axes");
+  trendElements.plot = document.getElementById("trend-plot");
+  trendElements.hover = document.getElementById("trend-hover");
+
+  const trend = {
+    rangeIndex: 1,
+    end: null, // right edge of the window; null = follows now
+    shown: null, // {start, end, top, data}: what is drawn right now, also mid-slide
+    moving: false, // loading or sliding to a new window; the periodic redraw waits
+    request: 0,
+    frame: 0,
+    firstReadingAt: null, // oldest reading the worker has; paging back stops there
+    pointer: null, // {x, y} in chart pixels while the pointer is over the chart
+  };
+  const trendTiles = new Map(); // "bucketSeconds:tile" -> {state, points, complete, retryAt, promise}
+  let liveReadings = []; // [{at, count}] from the websocket since the page opened, oldest first
+
+  const pacificFormat = new Intl.DateTimeFormat("en-US", { timeZone: "America/Los_Angeles", weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit", hour12: true });
+  function pacificParts(time) {
+    const parts = {};
+    for (const part of pacificFormat.formatToParts(time)) parts[part.type] = part.value.toLowerCase();
+    parts.hour24 = (Number(parts.hour) % 12) + (parts.dayPeriod === "pm" ? 12 : 0);
+    parts.clock = `${parts.hour}:${parts.minute}${parts.dayPeriod}`;
+    parts.date = `${parts.weekday} ${parts.month} ${parts.day}`;
+    return parts;
+  }
+
+  function trendWindow() {
+    const end = trend.end ?? Date.now();
+    return { start: end - TREND_RANGES[trend.rangeIndex].span, end };
+  }
+
+  function loadTrendTile(bucketSeconds, index) {
+    const key = `${bucketSeconds}:${index}`;
+    let tile = trendTiles.get(key);
+    if (!tile) trendTiles.set(key, (tile = { state: "new", points: [] }));
+    const endedIncomplete = tile.state === "loaded" && !tile.complete && Date.now() >= Math.max(tile.to, tile.retryAt);
+    const wanted = tile.state === "new" || tile.state === "stale" || endedIncomplete || ((tile.state === "failed" || tile.partial) && Date.now() >= tile.retryAt);
+    if (!wanted) return tile.promise;
+    tile.state = "loading";
+    tile.retryAt = Date.now() + 15000;
+    tile.promise = fetch(`/lunch-line-monitor/history/chart?bucket=${bucketSeconds}&tile=${index}`)
+      .then((response) => {
+        if (!response.ok) {
+          const retrySeconds = Number(response.headers.get("retry-after"));
+          if (Number.isFinite(retrySeconds) && retrySeconds > 0) tile.retryAt = Date.now() + Math.max(15, retrySeconds) * 1000;
+          throw new Error(`chart history request failed: ${response.status}`);
+        }
+        return response.json();
+      })
+      .then((body) => {
+        tile.points = bucketSeconds === 0
+          ? body.points.map(([at, count]) => ({ at, count }))
+          : body.points.map(([from, count, low, high, readings, sum, recordedThrough]) => ({ from, to: from + bucketSeconds * 1000, count, low, high, readings, sum, recordedThrough }));
+        tile.complete = body.complete;
+        tile.to = body.to;
+        tile.partial = body.partial;
+        tile.retryAt = Date.now() + 15000;
+        tile.state = "loaded";
+        if (body.first) trend.firstReadingAt = body.first;
+      })
+      .catch((error) => {
+        console.error(error);
+        tile.state = "failed";
+      });
+    return tile.promise;
+  }
+
+  function loadTrendTiles(range, start, end) {
+    const tileMilliseconds = TREND_TILE_SECONDS[range.bucketSeconds] * 1000;
+    const lead = range.bucketSeconds === 0 ? SMOOTHING_WINDOW_MILLISECONDS : 0; // the trailing average at the left edge looks back
+    const loads = [];
+    for (let index = Math.floor((start - lead) / tileMilliseconds); index * tileMilliseconds <= Math.min(end, Date.now()); index++) {
+      loads.push(loadTrendTile(range.bucketSeconds, index));
+    }
+    return Promise.all(loads);
+  }
+
+  // the websocket dropped for a while, so readings are missing from liveReadings: reload the tiles that were still filling
+  function refillTrendAfterReconnect() {
+    for (const tile of trendTiles.values()) if (tile.state === "loaded" && !tile.complete) tile.state = "stale";
   }
 
   function addTrendReading(update) {
-    const last = trendReadings[trendReadings.length - 1];
-    if (last && update.received_at - last.time < TREND_SAMPLE_MILLISECONDS) return;
-    trendReadings.push({ time: update.received_at, count: update.count });
+    const last = liveReadings[liveReadings.length - 1];
+    if (last && update.received_at - last.at < TREND_SAMPLE_MILLISECONDS) return;
+    liveReadings.push({ at: update.received_at, count: update.count });
+    if (liveReadings[0].at < update.received_at - 8 * DAY) liveReadings = liveReadings.filter((reading) => reading.at >= update.received_at - 7 * DAY);
   }
 
   function smoothedReadings(readings) {
@@ -234,48 +364,316 @@
     let windowSum = 0;
     readings.forEach((reading, index) => {
       windowSum += reading.count;
-      while (readings[windowStart].time < reading.time - SMOOTHING_WINDOW_MILLISECONDS) windowSum -= readings[windowStart++].count;
-      smoothed.push({ time: reading.time, count: windowSum / (index - windowStart + 1) });
+      while (readings[windowStart].at < reading.at - SMOOTHING_WINDOW_MILLISECONDS) windowSum -= readings[windowStart++].count;
+      smoothed.push({ at: reading.at, count: windowSum / (index - windowStart + 1) });
     });
     return smoothed;
   }
 
-  function renderTrend() {
+  // everything the chart can draw between start and end: loaded tiles, then the live readings that came after them.
+  // points[i] and line[i] describe the same moment: for readings, line is the trailing average; for buckets they are the same list
+  function trendData(range, start, end) {
     const now = Date.now();
-    const start = now - TREND_WINDOW_MILLISECONDS;
-    trendReadings = trendReadings.filter((reading) => reading.time >= start - SMOOTHING_WINDOW_MILLISECONDS);
-    const visible = trendReadings.filter((reading) => reading.time >= start);
-    const width = 720, height = 200, left = 28, right = 8, top = 8, bottom = 22;
-    const highestCount = Math.max(4, ...visible.map((reading) => reading.count));
-    const countStep = Math.ceil(highestCount / 4);
-    const maximumCount = countStep * Math.ceil(highestCount / countStep);
-    const x = (time) => left + ((time - start) / TREND_WINDOW_MILLISECONDS) * (width - left - right);
-    const y = (count) => top + (1 - count / maximumCount) * (height - top - bottom);
-    const parts = [];
-    for (let count = 0; count <= maximumCount; count += countStep) {
-      parts.push(`<line class="grid" x1="${left}" x2="${width - right}" y1="${y(count)}" y2="${y(count)}"/>`);
-      parts.push(`<text class="tick" x="${left - 6}" y="${y(count) + 4}" text-anchor="end">${count}</text>`);
+    const bucketMilliseconds = range.bucketSeconds * 1000;
+    const tileMilliseconds = TREND_TILE_SECONDS[range.bucketSeconds] * 1000;
+    const points = [];
+    let loading = false, failed = false, coveredUntil = 0;
+    for (let index = Math.floor((start - SMOOTHING_WINDOW_MILLISECONDS) / tileMilliseconds); index * tileMilliseconds <= end; index++) {
+      const tile = trendTiles.get(`${range.bucketSeconds}:${index}`);
+      if (!tile) continue;
+      if (tile.state === "loading") loading = true;
+      if (tile.state === "failed" || tile.partial) failed = true;
+      for (const point of tile.points) {
+        // a bucket is drawn at its end, like the trailing average; the bucket still filling is drawn at now
+        points.push(bucketMilliseconds ? { ...point, at: Math.min(point.to, now) } : point);
+        coveredUntil = bucketMilliseconds ? point.recordedThrough : point.at;
+      }
     }
-    const fifteenMinutes = 15 * 60 * 1000;
-    for (let tick = Math.ceil(start / fifteenMinutes) * fifteenMinutes; tick <= now; tick += fifteenMinutes) {
-      const label = new Date(tick).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: "America/Los_Angeles" }).toLowerCase().replace(" ", "");
-      parts.push(`<text class="tick" x="${x(tick)}" y="${height - 4}" text-anchor="middle">${label}</text>`);
+    let bucket = bucketMilliseconds ? points.at(-1) : null;
+    for (const reading of liveReadings) {
+      if (reading.at <= coveredUntil || reading.at > end) continue;
+      if (!bucketMilliseconds) { points.push(reading); continue; }
+      const from = Math.floor(reading.at / bucketMilliseconds) * bucketMilliseconds;
+      if (!bucket || bucket.from !== from) points.push((bucket = { from, to: from + bucketMilliseconds, at: Math.min(from + bucketMilliseconds, now), sum: 0, readings: 0, low: reading.count, high: reading.count }));
+      bucket.sum += reading.count;
+      bucket.readings += 1;
+      bucket.count = bucket.sum / bucket.readings;
+      bucket.recordedThrough = reading.at;
+      bucket.low = Math.min(bucket.low, reading.count);
+      bucket.high = Math.max(bucket.high, reading.count);
     }
-    if (visible.length === 0) {
-      parts.push(`<text class="empty" x="${(left + width - right) / 2}" y="${height / 2}" text-anchor="middle">no readings in the last 90 min</text>`);
-    }
-    for (const reading of visible) parts.push(`<circle class="raw" cx="${x(reading.time).toFixed(1)}" cy="${y(reading.count).toFixed(1)}" r="1.6"/>`);
-    let path = "";
-    let previousTime = null;
-    for (const point of smoothedReadings(trendReadings)) {
-      if (point.time < start) { previousTime = point.time; continue; }
-      const command = path === "" || point.time - previousTime > TREND_GAP_MILLISECONDS ? "M" : "L";
-      path += `${command}${x(point.time).toFixed(1)},${y(point.count).toFixed(1)}`;
-      previousTime = point.time;
-    }
-    if (path) parts.push(`<path class="smoothed" d="${path}"/>`);
-    trendSvg.innerHTML = parts.join("");
+    return {
+      range, points, loading, failed,
+      line: bucketMilliseconds ? points : smoothedReadings(points),
+      // a cached tile can be 5 min behind the live readings, which should not read as a camera outage on the long charts
+      gap: bucketMilliseconds ? Math.max(3 * bucketMilliseconds, 6 * MINUTE) : TREND_GAP_MILLISECONDS,
+    };
   }
+
+  function firstIndexAtOrAfter(points, time) {
+    let low = 0, high = points.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (points[middle].at < time) low = middle + 1; else high = middle;
+    }
+    return low;
+  }
+
+  // top of the count axis for a window: a multiple of the grid step, at least 4
+  function trendTop(data, start, end) {
+    let highest = 4;
+    for (let index = firstIndexAtOrAfter(data.points, start); index < data.points.length && data.points[index].at <= end; index++) {
+      highest = Math.max(highest, data.points[index].high ?? data.points[index].count);
+    }
+    const step = Math.ceil(highest / 4);
+    return step * Math.ceil(highest / step);
+  }
+
+  function trendTicks(start, end) {
+    const step = TREND_TICK_STEPS.find((candidate) => (end - start) / candidate <= 8) ?? DAY;
+    const stride = Math.min(step, HOUR); // pacific time is whole hours from utc, so sub-hour steps line up on their own
+    const ticks = [];
+    for (let time = Math.ceil(start / stride) * stride; time <= end; time += stride) {
+      const parts = pacificParts(time);
+      if (step > HOUR && parts.hour24 % (step / HOUR) !== 0) continue;
+      let label = parts.clock;
+      if (step >= DAY || (step >= HOUR && parts.hour24 === 0)) label = `${parts.weekday} ${parts.day}`;
+      else if (step >= HOUR) label = `${parts.hour}${parts.dayPeriod}`;
+      ticks.push({ time, label });
+    }
+    return ticks;
+  }
+
+  function trendScales(view) {
+    return {
+      x: (time) => CHART.left + ((time - view.start) / (view.end - view.start)) * CHART.plotWidth,
+      y: (count) => CHART.top + (1 - count / view.top) * CHART.plotHeight,
+    };
+  }
+
+  // draws the window [view.start, view.end] with the count axis reaching view.top
+  function drawTrendView(view, data) {
+    const { x, y } = trendScales(view);
+    const axes = [];
+    const countStep = Math.max(1, Math.ceil(view.top / 4));
+    for (let count = 0; count <= view.top + 0.001; count += countStep) {
+      axes.push(`<line class="grid" x1="${CHART.left}" x2="${CHART.width - CHART.right}" y1="${y(count).toFixed(1)}" y2="${y(count).toFixed(1)}"/>`);
+      axes.push(`<text class="tick" x="${CHART.left - 6}" y="${(y(count) + 4).toFixed(1)}" text-anchor="end">${count}</text>`);
+    }
+    for (const tick of trendTicks(view.start, view.end)) {
+      // labels fade out toward the plot edges so they slide in and out instead of popping
+      const edgeDistance = Math.min(x(tick.time) - CHART.left, CHART.width - CHART.right - x(tick.time));
+      if (edgeDistance < 0) continue;
+      axes.push(`<text class="tick" x="${x(tick.time).toFixed(1)}" y="${CHART.height - 4}" text-anchor="middle" opacity="${Math.min(1, edgeDistance / 16).toFixed(2)}">${tick.label}</text>`);
+    }
+    trendElements.axes.innerHTML = axes.join("");
+
+    // one point beyond each edge so the line runs off the plot instead of stopping short
+    const first = Math.max(0, firstIndexAtOrAfter(data.points, view.start) - 1);
+    const last = Math.min(data.points.length, firstIndexAtOrAfter(data.points, view.end) + 1);
+    const plot = [];
+    let line = "", bandTop = "", bandBottom = "", previousAt = null;
+    const closeBand = () => {
+      if (bandTop) plot.push(`<path class="band" d="M${bandTop.slice(1)}${bandBottom}Z"/>`);
+      bandTop = bandBottom = "";
+    };
+    for (let index = first; index < last; index++) {
+      const point = data.points[index];
+      const px = x(point.at).toFixed(1);
+      const joined = previousAt !== null && point.at - previousAt <= data.gap;
+      if (data.range.bucketSeconds === 0) {
+        plot.push(`<circle class="raw" cx="${px}" cy="${y(point.count).toFixed(1)}" r="1.6"/>`);
+      } else {
+        if (!joined) closeBand();
+        bandTop += `L${px},${y(point.high).toFixed(1)}`;
+        bandBottom = `L${px},${y(point.low).toFixed(1)}` + bandBottom;
+      }
+      line += `${joined ? "L" : "M"}${px},${y(data.line[index].count).toFixed(1)}`;
+      previousAt = point.at;
+    }
+    closeBand();
+    if (line) plot.push(`<path class="smoothed" d="${line}"/>`);
+    const anyVisible = data.points.slice(first, last).some((point) => point.at >= view.start && point.at <= view.end);
+    if (!anyVisible) {
+      const message = data.loading ? "loading…" : data.failed ? "history unavailable right now, retrying" : "no readings in this window";
+      plot.push(`<text class="empty" x="${CHART.left + CHART.plotWidth / 2}" y="${CHART.height / 2}" text-anchor="middle">${message}</text>`);
+    }
+    trendElements.plot.innerHTML = plot.join("");
+    trend.shown = { start: view.start, end: view.end, top: view.top, data };
+    drawTrendHover();
+  }
+
+  function describeTrendWindow() {
+    const range = TREND_RANGES[trend.rangeIndex];
+    if (trend.end === null) return `last ${range.name}`;
+    const start = pacificParts(trend.end - range.span), end = pacificParts(trend.end);
+    if (range.span > DAY) return `${start.month} ${start.day} – ${end.month} ${end.day}`;
+    if (start.date === end.date) return `${start.date}, ${start.clock} – ${end.clock}`;
+    return `${start.month} ${start.day}, ${start.clock} – ${end.month} ${end.day}, ${end.clock}`;
+  }
+
+  function updateTrendControls() {
+    const range = TREND_RANGES[trend.rangeIndex];
+    [...trendElements.ranges.children].forEach((button, index) => button.setAttribute("aria-pressed", String(index === trend.rangeIndex)));
+    trendElements.older.disabled = trend.firstReadingAt !== null && trendWindow().start <= trend.firstReadingAt;
+    trendElements.newer.disabled = trend.end === null;
+    trendElements.latest.disabled = trend.end === null; // always in place, so the arrows never move under the pointer
+    const legend = range.bucketSeconds === 0
+      ? "dots = each reading, line = 2 min average"
+      : `line = ${range.bucketSeconds / 60} min average, band = lowest to highest reading`;
+    const incomplete = trendData(range, trendWindow().start, trendWindow().end).failed ? " · some history unavailable" : "";
+    trendElements.title.textContent = `${describeTrendWindow()} · ${legend}${incomplete}`;
+    trendElements.svg.setAttribute("aria-label", `people detected, ${describeTrendWindow()}`);
+  }
+
+  // periodic redraw: keeps a live window following now and picks up tiles that finished loading
+  function drawTrend() {
+    if (trend.moving) return;
+    const range = TREND_RANGES[trend.rangeIndex];
+    const { start, end } = trendWindow();
+    loadTrendTiles(range, start, end);
+    const data = trendData(range, start, end);
+    drawTrendView({ start, end, top: trendTop(data, start, end) }, data);
+    updateTrendControls();
+  }
+
+  // moves the chart to the selected range and window: loads what is missing, then slides (or zooms) there from what is shown
+  async function showTrend(animate) {
+    const request = ++trend.request;
+    const range = TREND_RANGES[trend.rangeIndex];
+    cancelAnimationFrame(trend.frame);
+    trend.moving = true;
+    updateTrendControls();
+    if (trend.shown === null) {
+      const { start, end } = trendWindow();
+      loadTrendTiles(range, start, end);
+      drawTrendView({ start, end, top: 4 }, trendData(range, start, end));
+    }
+    trendElements.section.classList.add("loading");
+    const target = trendWindow();
+    await loadTrendTiles(range, target.start, target.end);
+    if (request !== trend.request) return;
+    trendElements.section.classList.remove("loading");
+    const from = trend.shown;
+    if (!animate || matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      trend.moving = false;
+      drawTrend();
+      return;
+    }
+    const data = trendData(range, Math.min(from.start, target.start), Math.max(from.end, target.end));
+    const targetTop = trendTop(data, target.start, target.end);
+    const fromSpan = from.end - from.start, targetSpan = target.end - target.start;
+    const startedAt = performance.now();
+    const step = (frameTime) => {
+      const progress = Math.min(1, Math.max(0, (frameTime - startedAt) / TREND_SLIDE_MILLISECONDS));
+      const eased = progress < 0.5 ? 4 * progress ** 3 : 1 - (-2 * progress + 2) ** 3 / 2;
+      // the window length changes by ratio, so zooming between 30 min and 7 days moves evenly
+      const span = fromSpan * (targetSpan / fromSpan) ** eased;
+      const end = from.end + (target.end - from.end) * eased;
+      drawTrendView({ start: end - span, end, top: from.top + (targetTop - from.top) * eased }, data);
+      if (progress < 1) {
+        trend.frame = requestAnimationFrame(step);
+      } else {
+        trend.moving = false;
+        drawTrend();
+      }
+    };
+    trend.frame = requestAnimationFrame(step);
+  }
+
+  function pageTrend(direction) {
+    const range = TREND_RANGES[trend.rangeIndex];
+    if (direction < 0 && trendElements.older.disabled) return;
+    if (direction > 0 && trend.end === null) return;
+    const end = trendWindow().end + direction * range.span;
+    trend.end = end >= Date.now() - 1000 ? null : end;
+    showTrend(true);
+  }
+
+  // hover: a vertical line snapped to the nearest point, with the values in a small box beside the pointer
+  function drawTrendHover() {
+    const shown = trend.shown;
+    const bounds = trendElements.svg.getBoundingClientRect();
+    const pointerX = trend.pointer && !trend.moving ? (trend.pointer.x / bounds.width) * CHART.width : null;
+    if (pointerX === null || pointerX < CHART.left || pointerX > CHART.width - CHART.right) {
+      trendElements.hover.innerHTML = "";
+      trendElements.tip.hidden = true;
+      return;
+    }
+    const { x, y } = trendScales(shown);
+    const { points, line, range, gap } = shown.data;
+    const time = shown.start + ((pointerX - CHART.left) / CHART.plotWidth) * (shown.end - shown.start);
+    let index = firstIndexAtOrAfter(points, time);
+    if (index === points.length || (index > 0 && time - points[index - 1].at < points[index].at - time)) index -= 1;
+    const point = points[index];
+    const found = point && Math.abs(point.at - time) <= gap && point.at >= shown.start && point.at <= shown.end;
+    const lineX = found ? x(point.at) : pointerX;
+    let marks = `<line class="cursor-line" x1="${lineX.toFixed(1)}" x2="${lineX.toFixed(1)}" y1="${CHART.top}" y2="${CHART.height - CHART.bottom}"/>`;
+    let rows;
+    if (!found) {
+      const parts = pacificParts(time);
+      rows = `<div class="tip-time">${parts.date} · ${parts.clock}</div><div>no readings here</div>`;
+    } else if (range.bucketSeconds === 0) {
+      const parts = pacificParts(point.at);
+      marks += `<circle class="cursor-reading" cx="${lineX.toFixed(1)}" cy="${y(point.count).toFixed(1)}" r="4"/>`;
+      rows = `<div class="tip-time">${parts.date} · ${parts.hour}:${parts.minute}:${parts.second}${parts.dayPeriod}</div>` +
+        `<div><b>${point.count}</b> ${point.count === 1 ? "person" : "people"} detected</div>` +
+        `<div><b>${line[index].count.toFixed(1)}</b> average over 2 min</div>`;
+    } else {
+      const start = pacificParts(point.from), end = pacificParts(point.to);
+      rows = `<div class="tip-time">${start.date} · ${start.clock} – ${end.clock}</div>` +
+        `<div><b>${point.low === point.high ? point.low : `${point.low}–${point.high}`}</b> people detected</div>` +
+        `<div><b>${point.count.toFixed(1)}</b> average over ${range.bucketSeconds / 60} min</div>`;
+    }
+    if (found) marks += `<circle class="cursor-average" cx="${lineX.toFixed(1)}" cy="${y(line[index].count).toFixed(1)}" r="4"/>`;
+    trendElements.hover.innerHTML = marks;
+    const tip = trendElements.tip;
+    tip.innerHTML = rows;
+    tip.hidden = false;
+    // right of the pointer and above it; flips to the other side at the chart's edges
+    let left = trend.pointer.x + 14;
+    if (left + tip.offsetWidth > bounds.width) left = trend.pointer.x - 14 - tip.offsetWidth;
+    let top = trend.pointer.y - tip.offsetHeight - 10;
+    if (top < -8) top = trend.pointer.y + 18;
+    tip.style.transform = `translate(${Math.max(0, left).toFixed(0)}px, ${top.toFixed(0)}px)`;
+  }
+
+  function trackTrendPointer(event) {
+    const bounds = trendElements.svg.getBoundingClientRect();
+    trend.pointer = { x: event.clientX - bounds.left, y: event.clientY - bounds.top };
+    drawTrendHover();
+  }
+  function releaseTrendPointer() {
+    trend.pointer = null;
+    drawTrendHover();
+  }
+  trendElements.chart.addEventListener("pointerdown", trackTrendPointer);
+  trendElements.chart.addEventListener("pointermove", trackTrendPointer);
+  trendElements.chart.addEventListener("pointerleave", releaseTrendPointer);
+  trendElements.chart.addEventListener("pointercancel", releaseTrendPointer);
+  // a finger has no hover: the box shows while it is down and goes when it lifts
+  trendElements.chart.addEventListener("pointerup", (event) => { if (event.pointerType !== "mouse") releaseTrendPointer(); });
+
+  TREND_RANGES.forEach((range, index) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = range.label;
+    button.title = `show ${range.name}`;
+    button.addEventListener("click", () => {
+      if (index === trend.rangeIndex) return;
+      trend.rangeIndex = index;
+      showTrend(true);
+    });
+    trendElements.ranges.appendChild(button);
+  });
+  trendElements.older.addEventListener("click", () => pageTrend(-1));
+  trendElements.newer.addEventListener("click", () => pageTrend(1));
+  trendElements.latest.addEventListener("click", () => { trend.end = null; showTrend(true); });
+  // with focus on any chart control, the arrow keys page too
+  trendElements.section.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowLeft") pageTrend(-1);
+    if (event.key === "ArrowRight") pageTrend(1);
+  });
 
   const feedbackElements = {
     form: document.getElementById("feedback-form"),
@@ -311,8 +709,8 @@
 
   connect();
   setInterval(renderStatus, 1000);
-  loadTrendHistory();
-  setInterval(renderTrend, 5000);
+  showTrend(false);
+  setInterval(drawTrend, 2000);
 </script>
 </body>
 </html>

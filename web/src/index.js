@@ -10,6 +10,20 @@ const MAXIMUM_FEEDBACK_CHARACTERS = 2000;
 const RECENT_HISTORY_MILLISECONDS = 92 * 60 * 1000;
 const MAXIMUM_HISTORY_HOURS = 168;
 const HISTORY_CACHE_SECONDS = 300;
+// the page's chart loads fixed tiles so every viewer shares the same cache entries.
+// key = bucket length in seconds (0 = every reading), value = tile length in seconds. page.html has the same table
+const CHART_TILE_SECONDS = { 0: 30 * 60, 60: 6 * 3600, 120: 12 * 3600, 900: 24 * 3600 };
+// a tile that ended before the request never changes again
+const PAST_CHART_TILE_CACHE_SECONDS = 86400;
+// leave three million account reads for recording, storage overhead and other applications.
+// reserve before reading; a restart forfeits the unused reservation instead of resetting the allowance
+const HISTORY_DAILY_READ_BUDGET = 2000000;
+const HISTORY_READ_RESERVATION = 10000;
+const MAXIMUM_RAW_HISTORY_ROWS = 350000;
+
+function historyLimitReached(error) {
+  return /rows.?read|SQLITE_FULL|daily.*limit|free.*limit|history read budget/i.test(String(error));
+}
 
 // one durable object fans camera updates out to every open browser over hibernatable websockets
 export class LunchLine extends DurableObject {
@@ -19,27 +33,79 @@ export class LunchLine extends DurableObject {
     this.latestUpdate = null;
     this.lastRecordedAt = 0;
     this.recentHistory = null;
+    this.recentHistoryUnavailable = false;
+    this.recentHistoryRetryAt = 0;
+    this.firstRecordedAt = null;
+    this.rolledUpThrough = null;
+    this.minuteHistoryReady = false;
+    this.readBudget = null;
+    this.readBudgetRemaining = 0;
+    this.historyReadRetryAfter = 0;
+    this.chartTiles = new Map();
     // the free plan's daily rows-read quota makes every sql call throw, even CREATE TABLE IF NOT EXISTS.
     // a throw here would kill the object and with it the live feed (11/20), so storage failures only stop recording
     try {
       const sql = this.ctx.storage.sql;
       sql.exec("CREATE TABLE IF NOT EXISTS history (recorded_at INTEGER PRIMARY KEY, count INTEGER NOT NULL, people TEXT NOT NULL)");
       sql.exec("CREATE TABLE IF NOT EXISTS feedback (submitted_at INTEGER NOT NULL, message TEXT NOT NULL)");
+      // one summary row per minute of readings, so the 6 h to 7 d charts read 1/30 of the rows (see rollUpMinutes)
+      this.ensureMinuteHistory();
     } catch (error) {
       console.error(`lunch line storage unavailable at startup: ${error}`);
+    }
+  }
+
+  historySql(maximumRowsRead, statement, ...bindings) {
+    const day = Math.floor(Date.now() / 86400000);
+    if (Date.now() < this.historyReadRetryAfter) throw new Error("history read budget or storage unavailable");
+    try {
+      if (this.readBudget?.day !== day) {
+        const saved = this.ctx.storage.kv.get("history-read-budget");
+        this.readBudget = saved?.day === day ? saved : { day, reserved: 0 };
+        this.readBudgetRemaining = 0;
+      }
+      if (this.readBudgetRemaining < maximumRowsRead) {
+        const reservation = Math.max(HISTORY_READ_RESERVATION, maximumRowsRead - this.readBudgetRemaining);
+        if (this.readBudget.reserved + reservation > HISTORY_DAILY_READ_BUDGET) {
+          throw new Error("history read budget reached");
+        }
+        const next = { day, reserved: this.readBudget.reserved + reservation };
+        this.ctx.storage.kv.put("history-read-budget", next);
+        this.readBudget = next;
+        this.readBudgetRemaining += reservation;
+      }
+      const cursor = this.ctx.storage.sql.exec(statement, ...bindings);
+      const rows = cursor.toArray();
+      this.readBudgetRemaining -= cursor.rowsRead;
+      if (cursor.rowsRead > maximumRowsRead) {
+        // an unexpected query plan must stop further reads, never silently outrun its reservation
+        this.historyReadRetryAfter = (day + 1) * 86400000;
+        throw new Error("history read budget estimate exceeded");
+      }
+      return rows;
+    } catch (error) {
+      if (historyLimitReached(error)) this.historyReadRetryAfter = (day + 1) * 86400000;
+      throw error;
     }
   }
 
   history(sinceMilliseconds) {
     const recentSince = Date.now() - RECENT_HISTORY_MILLISECONDS;
     if (sinceMilliseconds >= recentSince) {
-      if (this.recentHistory === null) {
+      if (this.recentHistory === null || (this.recentHistoryUnavailable && Date.now() >= this.recentHistoryRetryAt)) {
         try {
-          this.recentHistory = this.queryHistory(recentSince);
+          const saved = this.queryHistory(recentSince);
+          // recovery must retain readings that only reached memory while recording was blocked
+          const byTime = new Map((this.recentHistory ?? []).concat(saved).map((row) => [row.recorded_at, row]));
+          this.recentHistory = [...byTime.values()].sort((left, right) => left.recorded_at - right.recorded_at);
+          this.recentHistoryUnavailable = false;
         } catch (error) {
           // database blocked (daily read quota): the chart runs from memory, filled by live updates since the object started
           console.error(`lunch line history read failed, serving memory only: ${error}`);
-          this.recentHistory = [];
+          if (!historyLimitReached(error)) throw error;
+          if (this.recentHistory === null) this.recentHistory = [];
+          this.recentHistoryUnavailable = true;
+          this.recentHistoryRetryAt = Date.now() + 60000;
         }
       }
       this.recentHistory = this.recentHistory.filter((row) => row.recorded_at >= recentSince);
@@ -49,9 +115,117 @@ export class LunchLine extends DurableObject {
   }
 
   queryHistory(sinceMilliseconds) {
-    return this.ctx.storage.sql
-      .exec("SELECT recorded_at, count, people FROM history WHERE recorded_at >= ? ORDER BY recorded_at", sinceMilliseconds)
-      .toArray();
+    const limit = Date.now() - sinceMilliseconds <= RECENT_HISTORY_MILLISECONDS ? 10000 : MAXIMUM_RAW_HISTORY_ROWS;
+    return this.historySql(limit * 2 + 32,
+      "SELECT recorded_at, count, people FROM history WHERE recorded_at >= ? ORDER BY recorded_at LIMIT ?",
+      sinceMilliseconds, limit);
+  }
+
+  exportHistory(sinceMilliseconds) {
+    const rows = this.history(sinceMilliseconds);
+    const partial = sinceMilliseconds >= Date.now() - RECENT_HISTORY_MILLISECONDS && this.recentHistoryUnavailable;
+    return { rows, partial };
+  }
+
+  ensureMinuteHistory() {
+    if (this.minuteHistoryReady) return;
+    if (Date.now() < this.historyReadRetryAfter) throw new Error("history read budget or storage unavailable");
+    this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS history_minutes (minute_start INTEGER PRIMARY KEY, readings INTEGER NOT NULL, count_sum REAL NOT NULL, count_low REAL NOT NULL, count_high REAL NOT NULL, recorded_through INTEGER NOT NULL)");
+    this.minuteHistoryReady = true;
+  }
+
+  rollUpMinutes() {
+    this.ensureMinuteHistory();
+    if (this.rolledUpThrough === null) {
+      const latest = this.historySql(32, "SELECT MAX(minute_start) AS latest FROM history_minutes")[0].latest;
+      const first = latest ?? this.historySql(32, "SELECT MIN(recorded_at) AS first FROM history")[0].first;
+      if (first === null) return;
+      this.rolledUpThrough = Math.floor(first / 60000) * 60000;
+    }
+    const currentMinute = Math.floor(Date.now() / 60000) * 60000;
+    // backfill one bounded hour at a time, retaining progress if today's read allowance runs out
+    while (this.rolledUpThrough <= currentMinute) {
+      const end = Math.min(this.rolledUpThrough + 3600000, currentMinute + 60000);
+      const rows = this.historySql(20032,
+        "SELECT recorded_at, count FROM history WHERE recorded_at >= ? AND recorded_at < ? ORDER BY recorded_at LIMIT 10000",
+        this.rolledUpThrough, end);
+      if (rows.length === 10000) throw new Error("history hour exceeds bounded rollup size");
+      const minutes = new Map();
+      for (const row of rows) {
+        const start = Math.floor(row.recorded_at / 60000) * 60000;
+        let summary = minutes.get(start);
+        if (!summary) minutes.set(start, (summary = { readings: 0, sum: 0, low: row.count, high: row.count }));
+        summary.readings += 1;
+        summary.sum += row.count;
+        summary.low = Math.min(summary.low, row.count);
+        summary.high = Math.max(summary.high, row.count);
+        summary.through = row.recorded_at;
+      }
+      for (const [start, summary] of minutes) {
+        this.historySql(32,
+          "INSERT OR REPLACE INTO history_minutes (minute_start, readings, count_sum, count_low, count_high, recorded_through) VALUES (?, ?, ?, ?, ?, ?)",
+          start, summary.readings, summary.sum, summary.low, summary.high, summary.through);
+      }
+      this.rolledUpThrough = Math.min(end, currentMinute);
+      if (end > currentMinute) break;
+    }
+  }
+
+  // one chart tile covering [from, to). bucketSeconds 0: every reading as [time, count].
+  // otherwise [bucket start, mean, lowest, highest, readings, sum, last reading time] per bucket.
+  // `first` is the time of the oldest reading, so the page knows where paging back ends
+  chartTile(bucketSeconds, from, to) {
+    const key = `${bucketSeconds}:${from}`;
+    const cached = this.chartTiles.get(key);
+    if (cached && cached.expires > Date.now()) return cached.body;
+    if (this.firstRecordedAt === null) {
+      try {
+        this.firstRecordedAt = this.historySql(32, "SELECT MIN(recorded_at) AS first FROM history")[0].first;
+      } catch (error) {
+        // database blocked (daily read quota): recent tiles still come from memory below
+        console.error(`lunch line first reading lookup failed: ${error}`);
+      }
+    }
+    let points;
+    let partial = false;
+    if (bucketSeconds === 0) {
+      const recentSince = Date.now() - RECENT_HISTORY_MILLISECONDS;
+      let rows;
+      if (to > recentSince) {
+        rows = this.history(Math.max(from, recentSince));
+        partial = this.recentHistoryUnavailable;
+        if (from < recentSince) {
+          try {
+            const older = this.historySql(20032, "SELECT recorded_at, count FROM history WHERE recorded_at >= ? AND recorded_at < ? ORDER BY recorded_at LIMIT 10000", from, recentSince);
+            rows = older.concat(rows);
+          } catch (error) {
+            if (!historyLimitReached(error)) throw error;
+            partial = true;
+          }
+        }
+      } else {
+        rows = this.historySql(20032, "SELECT recorded_at, count FROM history WHERE recorded_at >= ? AND recorded_at < ? ORDER BY recorded_at LIMIT 10000", from, to);
+      }
+      points = rows.filter((row) => row.recorded_at < to).map((row) => [row.recorded_at, row.count]);
+    } else {
+      if (to > (this.rolledUpThrough ?? 0)) this.rollUpMinutes();
+      const bucketMilliseconds = bucketSeconds * 1000; // from the CHART_TILE_SECONDS keys, never user text
+      points = this.historySql(6000,
+          `SELECT (minute_start / ${bucketMilliseconds}) * ${bucketMilliseconds} AS bucket_start, ROUND(SUM(count_sum) / SUM(readings), 2) AS mean, MIN(count_low) AS low, MAX(count_high) AS high, SUM(readings) AS readings, SUM(count_sum) AS count_sum, MAX(recorded_through) AS recorded_through ` +
+            "FROM (SELECT * FROM history_minutes WHERE minute_start >= ? AND minute_start < ? ORDER BY minute_start LIMIT 1440) GROUP BY bucket_start ORDER BY bucket_start",
+          from,
+          to
+        )
+        .map((row) => [row.bucket_start, row.mean, row.low, row.high, row.readings, row.count_sum, row.recorded_through]);
+    }
+    const complete = to <= Date.now() && !partial;
+    const body = { first: this.firstRecordedAt, points, partial, complete };
+    if (!partial) {
+      if (this.chartTiles.size >= 64) this.chartTiles.delete(this.chartTiles.keys().next().value);
+      const expires = complete ? Date.now() + PAST_CHART_TILE_CACHE_SECONDS * 1000 : Math.min(to, Date.now() + HISTORY_CACHE_SECONDS * 1000);
+      this.chartTiles.set(key, { body, expires });
+    }
+    return body;
   }
 
   // anonymous: only the time and the text are kept
@@ -97,6 +271,7 @@ export class LunchLine extends DurableObject {
       console.error(`lunch line history row not recorded: ${error}`);
       // keep the 90 minute chart working from memory while the database is blocked
       if (this.recentHistory === null) this.recentHistory = [];
+      this.recentHistoryUnavailable = true;
     }
     if (this.recentHistory !== null) {
       const recentSince = update.received_at - RECENT_HISTORY_MILLISECONDS;
@@ -148,7 +323,8 @@ async function historyResponse(url, env) {
   if (!Number.isFinite(hours) || hours <= 0 || hours > MAXIMUM_HISTORY_HOURS) {
     return new Response(`hours must be a finite number greater than 0 and at most ${MAXIMUM_HISTORY_HOURS}`, { status: 400 });
   }
-  const rows = await lunchLineFor(env).history(Date.now() - hours * 3600 * 1000);
+  const { rows, partial } = await lunchLineFor(env).exportHistory(Date.now() - hours * 3600 * 1000);
+  if (partial) throw new Error("history read budget or storage unavailable");
   if (url.searchParams.get("format") === "json") {
     const body = rows.map((row) => ({
       recorded_at: row.recorded_at,
@@ -163,6 +339,42 @@ async function historyResponse(url, env) {
   return new Response(lines.join("\n") + "\n", {
     headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": 'inline; filename="lunch-line-history.csv"', "cache-control": "no-store" },
   });
+}
+
+// GET /lunch-line-monitor/history/chart?bucket=<seconds>&tile=<n>: tile n of the page's chart, covering
+// [n * tile length, (n + 1) * tile length) in unix time. bucket 0 = every reading, else averaged buckets (see chartTile)
+async function chartResponse(bucketSeconds, tile, env) {
+  const from = tile * CHART_TILE_SECONDS[bucketSeconds] * 1000;
+  const to = from + CHART_TILE_SECONDS[bucketSeconds] * 1000;
+  const { first, points, partial, complete } = await lunchLineFor(env).chartTile(bucketSeconds, from, to);
+  const seconds = complete ? PAST_CHART_TILE_CACHE_SECONDS : Math.min(HISTORY_CACHE_SECONDS, Math.floor((to - Date.now()) / 1000));
+  return Response.json({ bucket_seconds: bucketSeconds, from, to, first, points, partial, complete }, {
+    headers: { "cache-control": partial || seconds <= 0 ? "no-store" : `public, max-age=${seconds}` },
+  });
+}
+
+// serves a history response from the edge cache, or builds it and caches it for cacheSeconds
+async function cachedHistoryResponse(cacheUrl, cacheSeconds, ctx, buildResponse) {
+  const cacheRequest = new Request(cacheUrl, { method: "GET" });
+  const cached = await caches.default.match(cacheRequest);
+  if (cached) return cached;
+  try {
+    const response = await buildResponse();
+    if (response.ok && response.headers.get("cache-control") !== "no-store") {
+      const cacheable = new Response(response.body, response);
+      cacheable.headers.set("cache-control", response.headers.get("cache-control") ?? `public, max-age=${cacheSeconds}`);
+      ctx.waitUntil(caches.default.put(cacheRequest, cacheable.clone()));
+      return cacheable;
+    }
+    return response;
+  } catch (error) {
+    if (!historyLimitReached(error)) throw error;
+    const reset = (Math.floor(Date.now() / 86400000) + 1) * 86400000;
+    return new Response("count history temporarily paused to protect the daily read allowance; live camera and count remain available", {
+      status: 503,
+      headers: { "cache-control": "no-store", "retry-after": String(Math.ceil((reset - Date.now()) / 1000)) },
+    });
+  }
 }
 
 const API_HEADERS = { "cache-control": "no-store", "access-control-allow-origin": "*" };
@@ -227,33 +439,30 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, "");
 
+    if (path === `${BASE_PATH}/history/chart`) {
+      const bucketSeconds = Number(url.searchParams.get("bucket"));
+      const tile = Number(url.searchParams.get("tile"));
+      const tileMilliseconds = CHART_TILE_SECONDS[bucketSeconds] * 1000;
+      if (!(bucketSeconds in CHART_TILE_SECONDS) || !Number.isInteger(tile) || tile < 0 || tile * tileMilliseconds > Date.now()) {
+        return new Response(`bucket must be one of ${Object.keys(CHART_TILE_SECONDS).join(", ")} and tile a whole number that has already started`, { status: 400 });
+      }
+      const cacheUrl = new URL(`https://nuevasocratica.com${BASE_PATH}/history/chart`);
+      cacheUrl.searchParams.set("bucket", String(bucketSeconds));
+      cacheUrl.searchParams.set("tile", String(tile));
+      const cacheSeconds = (tile + 1) * tileMilliseconds <= Date.now() ? PAST_CHART_TILE_CACHE_SECONDS : HISTORY_CACHE_SECONDS;
+      return cachedHistoryResponse(cacheUrl, cacheSeconds, ctx, () => chartResponse(bucketSeconds, tile, env));
+    }
     if (path === `${BASE_PATH}/history`) {
       const hours = Number(url.searchParams.get("hours") ?? 24);
       if (!Number.isFinite(hours) || hours <= 0 || hours > MAXIMUM_HISTORY_HOURS) return historyResponse(url, env);
       const cacheUrl = new URL(`https://nuevasocratica.com${BASE_PATH}/history`);
       cacheUrl.searchParams.set("hours", String(hours));
       if (url.searchParams.get("format") === "json") cacheUrl.searchParams.set("format", "json");
-      const cacheRequest = new Request(cacheUrl, { method: "GET" });
-      const cached = await caches.default.match(cacheRequest);
-      if (cached) return cached;
-      try {
+      return cachedHistoryResponse(cacheUrl, HISTORY_CACHE_SECONDS, ctx, async () => {
         const response = await historyResponse(url, env);
-        if (response.ok) {
-          const cacheable = new Response(response.body, response);
-          cacheable.headers.set("cache-control", `public, max-age=${HISTORY_CACHE_SECONDS}`);
-          ctx.waitUntil(caches.default.put(cacheRequest, cacheable.clone()));
-          return cacheable;
-        }
+        response.headers.delete("cache-control");
         return response;
-      } catch (error) {
-        if (!/rows.?read|SQLITE_FULL|daily.*limit|free.*limit/i.test(String(error))) throw error;
-        const reset = new Date();
-        reset.setUTCHours(24, 0, 0, 0);
-        return new Response("count history temporarily unavailable: database daily read limit reached; live camera and count remain available", {
-          status: 503,
-          headers: { "cache-control": "no-store", "retry-after": String(Math.ceil((reset.getTime() - Date.now()) / 1000)) },
-        });
-      }
+      });
     }
     if (path === `${BASE_PATH}/api/count` || path === `${BASE_PATH}/api/image.jpg`) return apiResponse(path, env);
 
