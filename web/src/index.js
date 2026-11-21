@@ -20,6 +20,24 @@ const PAST_CHART_TILE_CACHE_SECONDS = 86400;
 const HISTORY_DAILY_READ_BUDGET = 2000000;
 const HISTORY_READ_RESERVATION = 10000;
 const MAXIMUM_RAW_HISTORY_ROWS = 350000;
+const EXPORT_CHUNK_MILLISECONDS = 3600000;
+const MAXIMUM_EXPORT_CHUNK_ROWS = 10000;
+// leave room below sqlite's 2 MB row limit for keys and row metadata
+const MAXIMUM_EXPORT_PART_BYTES = 1024 * 1024;
+
+function packHistoryRows(rows) {
+  if (!rows.length) return [];
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const bytes = encoder.encode(JSON.stringify(rows.map((row) => [row.recorded_at, row.count, row.people])));
+  const payloads = [];
+  // a streaming decoder preserves unicode characters split across byte boundaries
+  const partBytes = MAXIMUM_EXPORT_PART_BYTES - 4;
+  for (let offset = 0; offset < bytes.length; offset += partBytes) {
+    payloads.push(decoder.decode(bytes.subarray(offset, offset + partBytes), { stream: offset + partBytes < bytes.length }));
+  }
+  return payloads;
+}
 
 function historyLimitReached(error) {
   return /rows.?read|SQLITE_FULL|daily.*limit|free.*limit|history read budget/i.test(String(error));
@@ -41,6 +59,8 @@ export class LunchLine extends DurableObject {
     this.readBudget = null;
     this.readBudgetRemaining = 0;
     this.historyReadRetryAfter = 0;
+    this.historyRowsRead = 0;
+    this.exportChunksReady = false;
     this.chartTiles = new Map();
     // the free plan's daily rows-read quota makes every sql call throw, even CREATE TABLE IF NOT EXISTS.
     // a throw here would kill the object and with it the live feed (11/20), so storage failures only stop recording
@@ -55,27 +75,33 @@ export class LunchLine extends DurableObject {
     }
   }
 
-  historySql(maximumRowsRead, statement, ...bindings) {
+  reserveHistoryReads(maximumRowsRead) {
     const day = Math.floor(Date.now() / 86400000);
     if (Date.now() < this.historyReadRetryAfter) throw new Error("history read budget or storage unavailable");
+    if (this.readBudget?.day !== day) {
+      const saved = this.ctx.storage.kv.get("history-read-budget");
+      this.readBudget = saved?.day === day ? saved : { day, reserved: 0 };
+      this.readBudgetRemaining = 0;
+    }
+    if (this.readBudgetRemaining < maximumRowsRead) {
+      const reservation = Math.max(HISTORY_READ_RESERVATION, maximumRowsRead - this.readBudgetRemaining);
+      if (this.readBudget.reserved + reservation > HISTORY_DAILY_READ_BUDGET) {
+        throw new Error("history read budget reached");
+      }
+      const next = { day, reserved: this.readBudget.reserved + reservation };
+      this.ctx.storage.kv.put("history-read-budget", next);
+      this.readBudget = next;
+      this.readBudgetRemaining += reservation;
+    }
+  }
+
+  historySql(maximumRowsRead, statement, ...bindings) {
+    const day = Math.floor(Date.now() / 86400000);
     try {
-      if (this.readBudget?.day !== day) {
-        const saved = this.ctx.storage.kv.get("history-read-budget");
-        this.readBudget = saved?.day === day ? saved : { day, reserved: 0 };
-        this.readBudgetRemaining = 0;
-      }
-      if (this.readBudgetRemaining < maximumRowsRead) {
-        const reservation = Math.max(HISTORY_READ_RESERVATION, maximumRowsRead - this.readBudgetRemaining);
-        if (this.readBudget.reserved + reservation > HISTORY_DAILY_READ_BUDGET) {
-          throw new Error("history read budget reached");
-        }
-        const next = { day, reserved: this.readBudget.reserved + reservation };
-        this.ctx.storage.kv.put("history-read-budget", next);
-        this.readBudget = next;
-        this.readBudgetRemaining += reservation;
-      }
+      this.reserveHistoryReads(maximumRowsRead);
       const cursor = this.ctx.storage.sql.exec(statement, ...bindings);
       const rows = cursor.toArray();
+      this.historyRowsRead += cursor.rowsRead;
       this.readBudgetRemaining -= cursor.rowsRead;
       if (cursor.rowsRead > maximumRowsRead) {
         // an unexpected query plan must stop further reads, never silently outrun its reservation
@@ -122,9 +148,72 @@ export class LunchLine extends DurableObject {
   }
 
   exportHistory(sinceMilliseconds) {
-    const rows = this.history(sinceMilliseconds);
-    const partial = sinceMilliseconds >= Date.now() - RECENT_HISTORY_MILLISECONDS && this.recentHistoryUnavailable;
-    return { rows, partial };
+    const before = this.historyRowsRead;
+    const diagnostics = { chunksBuilt: 0, chunksReused: 0, rowsRead: 0 };
+    if (sinceMilliseconds >= Date.now() - RECENT_HISTORY_MILLISECONDS) {
+      const rows = this.history(sinceMilliseconds);
+      diagnostics.rowsRead = this.historyRowsRead - before;
+      return { rows, partial: this.recentHistoryUnavailable, diagnostics };
+    }
+    const currentHour = Math.floor(Date.now() / EXPORT_CHUNK_MILLISECONDS) * EXPORT_CHUNK_MILLISECONDS;
+    // the unfinished hour shares the recent cache, which camera messages extend without another query
+    const tail = this.history(currentHour);
+    if (this.recentHistoryUnavailable) throw new Error("history read budget or storage unavailable");
+    this.ensureExportChunks();
+    const rows = [];
+    for (let from = Math.floor(sinceMilliseconds / EXPORT_CHUNK_MILLISECONDS) * EXPORT_CHUNK_MILLISECONDS;
+      from < currentHour; from += EXPORT_CHUNK_MILLISECONDS) {
+      const chunk = this.exportChunk(from);
+      diagnostics[chunk.reused ? "chunksReused" : "chunksBuilt"] += 1;
+      for (const row of chunk.rows) if (row.recorded_at >= sinceMilliseconds) rows.push(row);
+      if (rows.length > MAXIMUM_RAW_HISTORY_ROWS) throw new Error("history export exceeds bounded row count");
+    }
+    rows.push(...tail);
+    if (rows.length > MAXIMUM_RAW_HISTORY_ROWS) throw new Error("history export exceeds bounded row count");
+    diagnostics.rowsRead = this.historyRowsRead - before;
+    return { rows, partial: false, diagnostics };
+  }
+
+  ensureExportChunks() {
+    if (this.exportChunksReady) return;
+    if (Date.now() < this.historyReadRetryAfter) throw new Error("history read budget or storage unavailable");
+    this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS history_export_chunks_v1 (chunk_start INTEGER NOT NULL, part INTEGER NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (chunk_start, part))");
+    this.exportChunksReady = true;
+  }
+
+  exportChunk(from) {
+    const to = from + EXPORT_CHUNK_MILLISECONDS;
+    if (to > Date.now()) throw new Error("cannot seal an unfinished history hour");
+    const cached = this.historySql(20034,
+      "SELECT part, payload FROM history_export_chunks_v1 WHERE chunk_start = ? ORDER BY part LIMIT ?",
+      from, MAXIMUM_EXPORT_CHUNK_ROWS + 1);
+    if (cached.length) {
+      const header = JSON.parse(cached[0].payload);
+      if (cached[0].part !== 0 || header.to !== to || header.parts !== cached.length - 1) {
+        throw new Error("incomplete persistent history chunk");
+      }
+      for (let index = 1; index < cached.length; index += 1) {
+        if (cached[index].part !== index) throw new Error("missing persistent history chunk part");
+      }
+      const tuples = header.parts ? JSON.parse(cached.slice(1).map((part) => part.payload).join("")) : [];
+      const rows = tuples.map(([recorded_at, count, people]) => ({ recorded_at, count, people }));
+      if (rows.length !== header.rows) throw new Error("persistent history chunk row count mismatch");
+      return { rows, reused: true };
+    }
+    const rows = this.historySql(20032,
+      "SELECT recorded_at, count, people FROM history WHERE recorded_at >= ? AND recorded_at < ? ORDER BY recorded_at LIMIT ?",
+      from, to, MAXIMUM_EXPORT_CHUNK_ROWS);
+    if (rows.length === MAXIMUM_EXPORT_CHUNK_ROWS) throw new Error("history hour exceeds bounded export size");
+    const payloads = packHistoryRows(rows);
+    // reserve outside the transaction so a rollback cannot undo the durable read reservation
+    this.reserveHistoryReads(32 * (payloads.length + 1));
+    this.ctx.storage.transactionSync(() => {
+      const header = JSON.stringify({ to, rows: rows.length, parts: payloads.length });
+      for (const [part, payload] of [header, ...payloads].entries()) {
+        this.historySql(32, "INSERT INTO history_export_chunks_v1 (chunk_start, part, payload) VALUES (?, ?, ?)", from, part, payload);
+      }
+    });
+    return { rows, reused: false };
   }
 
   ensureMinuteHistory() {
@@ -323,8 +412,16 @@ async function historyResponse(url, env) {
   if (!Number.isFinite(hours) || hours <= 0 || hours > MAXIMUM_HISTORY_HOURS) {
     return new Response(`hours must be a finite number greater than 0 and at most ${MAXIMUM_HISTORY_HOURS}`, { status: 400 });
   }
-  const { rows, partial } = await lunchLineFor(env).exportHistory(Date.now() - hours * 3600 * 1000);
+  const { rows, partial, diagnostics } = await lunchLineFor(env).exportHistory(Date.now() - hours * 3600 * 1000);
   if (partial) throw new Error("history read budget or storage unavailable");
+  const headers = { "cache-control": "no-store" };
+  // response counters let deployment checks distinguish a warm edge response from actual persistent reuse
+  if (diagnostics) {
+    headers["x-history-storage"] = "persistent-chunks-v1";
+    headers["x-history-rows-read"] = String(diagnostics.rowsRead);
+    headers["x-history-chunks-built"] = String(diagnostics.chunksBuilt);
+    headers["x-history-chunks-reused"] = String(diagnostics.chunksReused);
+  }
   if (url.searchParams.get("format") === "json") {
     const body = rows.map((row) => ({
       recorded_at: row.recorded_at,
@@ -332,12 +429,12 @@ async function historyResponse(url, env) {
       count: row.count,
       people: JSON.parse(row.people),
     }));
-    return Response.json(body, { headers: { "cache-control": "no-store" } });
+    return Response.json(body, { headers });
   }
   const lines = ["pacific_time,unix_milliseconds,count"];
   for (const row of rows) lines.push(`${pacificTime(row.recorded_at)},${row.recorded_at},${row.count}`);
   return new Response(lines.join("\n") + "\n", {
-    headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": 'inline; filename="lunch-line-history.csv"', "cache-control": "no-store" },
+    headers: { ...headers, "content-type": "text/csv; charset=utf-8", "content-disposition": 'inline; filename="lunch-line-history.csv"' },
   });
 }
 
