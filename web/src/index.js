@@ -407,8 +407,19 @@ async function bearerTokenMatches(authorizationHeader, expectedToken) {
   return given.byteLength === expected.byteLength && crypto.subtle.timingSafeEqual(given, expected);
 }
 
+const pacificHourPrefixes = new Map();
+
 function pacificTime(milliseconds) {
-  return new Date(milliseconds).toLocaleString("sv-SE", { timeZone: "America/Los_Angeles" });
+  const hourStart = Math.floor(milliseconds / 3600000) * 3600000;
+  let prefix = pacificHourPrefixes.get(hourStart);
+  if (prefix === undefined) {
+    prefix = new Date(hourStart).toLocaleString("sv-SE", { timeZone: "America/Los_Angeles" }).slice(0, 13);
+    if (pacificHourPrefixes.size >= 192) pacificHourPrefixes.delete(pacificHourPrefixes.keys().next().value);
+    pacificHourPrefixes.set(hourStart, prefix);
+  }
+  // pacific daylight-saving transitions fall on coordinated universal time (UTC) hour boundaries; minutes and seconds remain unchanged
+  const secondsInHour = Math.floor((milliseconds - hourStart) / 1000);
+  return `${prefix}:${String(Math.floor(secondsInHour / 60)).padStart(2, "0")}:${String(secondsInHour % 60).padStart(2, "0")}`;
 }
 
 // posts one feedback submission to #feedback in the socratica discord through a channel webhook.
@@ -439,7 +450,7 @@ async function historyResponse(url, env) {
   }
   const { rows, partial, diagnostics } = await lunchLineFor(env).exportHistory(Date.now() - hours * 3600 * 1000);
   if (partial) throw new Error("history read budget or storage unavailable");
-  const headers = { "cache-control": "no-store" };
+  const headers = { "cache-control": "no-store", "x-history-time-format": "hour-prefix-v1" };
   // response counters let deployment checks distinguish a warm edge response from actual persistent reuse
   if (diagnostics) {
     headers["x-history-storage"] = "persistent-chunks-v1";
