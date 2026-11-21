@@ -303,26 +303,32 @@
     const key = `${bucketSeconds}:${index}`;
     let tile = trendTiles.get(key);
     if (!tile) trendTiles.set(key, (tile = { state: "new", points: [] }));
-    const wanted = tile.state === "new" || tile.state === "stale" || (tile.state === "failed" && Date.now() >= tile.retryAt);
+    const wanted = tile.state === "new" || tile.state === "stale" || ((tile.state === "failed" || tile.partial) && Date.now() >= tile.retryAt);
     if (!wanted) return tile.promise;
     tile.state = "loading";
+    tile.retryAt = Date.now() + 15000;
     tile.promise = fetch(`/lunch-line-monitor/history/chart?bucket=${bucketSeconds}&tile=${index}`)
       .then((response) => {
-        if (!response.ok) throw new Error(`chart history request failed: ${response.status}`);
+        if (!response.ok) {
+          const retrySeconds = Number(response.headers.get("retry-after"));
+          if (Number.isFinite(retrySeconds) && retrySeconds > 0) tile.retryAt = Date.now() + Math.max(15, retrySeconds) * 1000;
+          throw new Error(`chart history request failed: ${response.status}`);
+        }
         return response.json();
       })
       .then((body) => {
         tile.points = bucketSeconds === 0
           ? body.points.map(([at, count]) => ({ at, count }))
-          : body.points.map(([from, count, low, high]) => ({ from, to: from + bucketSeconds * 1000, count, low, high }));
-        tile.complete = body.to <= Date.now();
+          : body.points.map(([from, count, low, high, readings, sum, recordedThrough]) => ({ from, to: from + bucketSeconds * 1000, count, low, high, readings, sum, recordedThrough }));
+        tile.complete = body.to <= Date.now() && !body.partial;
+        tile.partial = body.partial;
+        tile.retryAt = Date.now() + 15000;
         tile.state = "loaded";
         if (body.first) trend.firstReadingAt = body.first;
       })
       .catch((error) => {
         console.error(error);
         tile.state = "failed";
-        tile.retryAt = Date.now() + 15000;
       });
     return tile.promise;
   }
@@ -374,14 +380,14 @@
       const tile = trendTiles.get(`${range.bucketSeconds}:${index}`);
       if (!tile) continue;
       if (tile.state === "loading") loading = true;
-      if (tile.state === "failed") failed = true;
+      if (tile.state === "failed" || tile.partial) failed = true;
       for (const point of tile.points) {
         // a bucket is drawn at its end, like the trailing average; the bucket still filling is drawn at now
         points.push(bucketMilliseconds ? { ...point, at: Math.min(point.to, now) } : point);
-        coveredUntil = bucketMilliseconds ? point.to : point.at;
+        coveredUntil = bucketMilliseconds ? point.recordedThrough : point.at;
       }
     }
-    let bucket = null;
+    let bucket = bucketMilliseconds ? points.at(-1) : null;
     for (const reading of liveReadings) {
       if (reading.at <= coveredUntil || reading.at > end) continue;
       if (!bucketMilliseconds) { points.push(reading); continue; }
@@ -390,6 +396,7 @@
       bucket.sum += reading.count;
       bucket.readings += 1;
       bucket.count = bucket.sum / bucket.readings;
+      bucket.recordedThrough = reading.at;
       bucket.low = Math.min(bucket.low, reading.count);
       bucket.high = Math.max(bucket.high, reading.count);
     }
@@ -512,7 +519,8 @@
     const legend = range.bucketSeconds === 0
       ? "dots = each reading, line = 2 min average"
       : `line = ${range.bucketSeconds / 60} min average, band = lowest to highest reading`;
-    trendElements.title.textContent = `${describeTrendWindow()} · ${legend}`;
+    const incomplete = trendData(range, trendWindow().start, trendWindow().end).failed ? " · some history unavailable" : "";
+    trendElements.title.textContent = `${describeTrendWindow()} · ${legend}${incomplete}`;
     trendElements.svg.setAttribute("aria-label", `people detected, ${describeTrendWindow()}`);
   }
 
